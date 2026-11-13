@@ -28,7 +28,9 @@ void initObserverState(const ObserverSnapshot& obSnapshot, ViewSendToken& obStat
 
 AoiViewSet::AoiViewSet()
 {
-
+    views_.reserve(1000);
+    snapshotTasks_.reserve(100);
+    undoSearch_.reserve(64);
 }
 
 AoiViewSet::~AoiViewSet()
@@ -150,37 +152,76 @@ bool AoiViewSet::commitAccepted(EntityId observerId,
     if(vIt->second.nextViewSeq == std::numeric_limits<uint64_t>::max())
         return false;
 
-    // 分配、校验和操作都在副本中进行，失败不留下部分基线或 pending 变更。
-    auto next = vIt->second;
-    for(const auto& push : items)
+    //拷贝处理
+    // // 分配、校验和操作都在副本中进行，失败不留下部分基线或 pending 变更。
+    // auto next = vIt->second;
+    // for(const auto& push : items)
+    // {
+    //     if(push.targetId == 0 ||
+    //        (push.state.kind != EntityKind::kPlayer && push.state.kind != EntityKind::kMonster &&
+    //         push.state.kind != EntityKind::kNpc && push.state.kind != EntityKind::kDrop))
+    //         return false;
+    //     bool res = false;
+    //     switch (push.kind) 
+    //     {
+    //     case AoiMsgKind::kEntry:
+    //         res = processEntry(push, next);
+    //         break;
+    //     case AoiMsgKind::kMove:
+    //         res = processMove(push, next);
+    //         break;
+    //     case AoiMsgKind::kLeave:
+    //         res = processLeave(push, next);
+    //         break;
+    //     default:
+    //         return false;
+    //     }
+    //     if(!res)
+    //         return false;
+    //     next.pendings_.erase(push.targetId);
+    // }
+    // auto& current = vIt->second;
+    // current.committedState_.swap(next.committedState_);
+    // current.pendings_.swap(next.pendings_);
+    // ++current.nextViewSeq;
+    // return true;
+
+    //直接处理]
+    undoSearch_.clear();
+    bool ok = true;
+    for(auto& push : items)
     {
-        if(push.targetId == 0 ||
-           (push.state.kind != EntityKind::kPlayer && push.state.kind != EntityKind::kMonster &&
-            push.state.kind != EntityKind::kNpc && push.state.kind != EntityKind::kDrop))
-            return false;
-        bool res = false;
-        switch (push.kind) 
+        const auto it = vIt->second.committedState_.find(push.targetId);
+        undoSearch_.push_back(Undo{
+                                 push.targetId,
+                                 it != vIt->second.committedState_.end(),
+                                 it != vIt->second.committedState_.end()? it->second : SentEntityState{},
+                                 vIt->second.pendings_.contains(push.targetId)});
+        if(!applyPush(push, vIt->second))
         {
-        case AoiMsgKind::kEntry:
-            res = processEntry(push, next);
+            ok = false;
             break;
-        case AoiMsgKind::kMove:
-            res = processMove(push, next);
-            break;
-        case AoiMsgKind::kLeave:
-            res = processLeave(push, next);
-            break;
-        default:
-            return false;
         }
-        if(!res)
-            return false;
-        next.pendings_.erase(push.targetId);
+        vIt->second.pendings_.erase(push.targetId);
     }
-    auto& current = vIt->second;
-    current.committedState_.swap(next.committedState_);
-    current.pendings_.swap(next.pendings_);
-    ++current.nextViewSeq;
+
+    if(!ok)
+    {
+        for(auto rit = undoSearch_.begin(); rit != undoSearch_.end(); ++rit)
+        {
+            if(rit->hasOld)
+                vIt->second.committedState_[rit->eId] = rit->old;
+            else
+                vIt->second.committedState_.erase(rit->eId);
+            
+            if(rit->hasPending)
+                vIt->second.pendings_.insert(rit->eId);
+            else
+                vIt->second.pendings_.erase(rit->eId);
+        }
+        return false;
+    }
+    ++vIt->second.nextViewSeq;
     return true;
 }
 
@@ -396,6 +437,28 @@ bool AoiViewSet::references(EntityId targetId, uint32_t entityGeneration) const
 
 
 //----------------------------private----------------------------
+bool AoiViewSet::applyPush(const AcceptedPush& push, ObserverSnapshot& obss)
+{
+    bool res = false;
+    switch (push.kind) 
+    {
+    case AoiMsgKind::kEntry:
+        res = processEntry(push, obss);
+        break;
+    case AoiMsgKind::kMove:
+        res = processMove(push, obss);
+        break;
+    case AoiMsgKind::kLeave:
+        res = processLeave(push, obss);
+        break;
+    default:
+        return false;
+    }
+    return res;
+}
+
+
+
 bool AoiViewSet::processEntry(const AcceptedPush& push, ObserverSnapshot& obss)
 {
     if(push.kind != AoiMsgKind::kEntry)

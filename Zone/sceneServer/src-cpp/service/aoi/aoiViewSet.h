@@ -132,6 +132,15 @@ public:
     bool references(EntityId targetId) const;
     bool references(EntityId targetId, uint32_t entityGeneration) const;
 private:
+    struct Undo
+    {
+        EntityId eId = 0;
+        
+        bool hasOld = false;
+        SentEntityState old;
+        bool hasPending = false;
+    };
+
     struct SnapshotTask
     {
         ViewSnapshotToken token;
@@ -140,11 +149,15 @@ private:
         uint32_t acceptedCount = 0;
     };
     SnapshotTask* findSnapshotTask(const ViewSnapshotToken& token);
+
+    bool applyPush(const AcceptedPush& push, ObserverSnapshot& obss);
+
     bool processEntry(const AcceptedPush& push, ObserverSnapshot& obss);
     bool processMove(const AcceptedPush& push, ObserverSnapshot& obss);
     bool processLeave(const AcceptedPush& push, ObserverSnapshot& obss);
     
-
+    //回滚日志
+    std::vector<Undo> undoSearch_;
     //观察者实例ID->对应快照
     std::unordered_map<EntityId, ObserverSnapshot> views_;
 

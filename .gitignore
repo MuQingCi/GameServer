@@ -1,8 +1,0 @@
-# 构建产物
-Zone/build
-Zone/*.log
-Zone/compile_commands.json
-.cache/
-docs/*
-docker-data/
-.VSCodeCounter/*
