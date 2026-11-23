@@ -61,6 +61,9 @@ public:
         bool persistenceEnabled = true; // 无 DB 的开发模式中显式关闭持久化。
         int64_t shutdownDrainMs = 5000;
         bool activeIndex = false;
+        // 分散出生点：仅对"位置恰为 (0,0)"的新角色生效，默认关闭
+        bool spawnScatter = false;
+        uint32_t spawnSpacing = 100;
     };
 
     LogicThread(uint32_t threadId, MsgBus& bus, const Config& cfg, const AoiConfig& aoiCfg,

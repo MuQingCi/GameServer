@@ -63,7 +63,11 @@ AoiWorkerPublishResult WorkerPushSink::publishToWorkers(const AoiWorkerPublishRe
             msg.head.Module = request.module;
             msg.head.Method = request.method;
             msg.head.serviceSenderWorkerId = self;
-            msg.body = request.body;
+            // 共享载荷优先：一次编码即可发给多个 worker，不再逐目标拷贝
+            if (request.sharedBody)
+                msg.sharedBody = request.sharedBody;
+            else
+                msg.body = request.body;
             accepted = IsAccepted(msgBus_.sendToWorker(target, std::move(msg)));
         }
         result.deliveries.push_back({target, accepted});

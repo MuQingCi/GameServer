@@ -64,8 +64,10 @@ private:
     SceneMetrics metrics_;
     Map map_; // 声明在 workers 前，销毁时比所有 worker 更晚。
 
+    void StopNetShards();   // 停止所有网络分片（幂等）
+
     std::unique_ptr<MsgBus> bus_;
-    std::unique_ptr<NetServer> netServer_;
+    std::vector<std::unique_ptr<NetServer>> netServers_;   // 网络分片（epoll 线程）
     std::unique_ptr<TimerThread> timerThread_;
     std::unique_ptr<DBThread> dbThread_;
     std::vector<std::unique_ptr<LogicThread>> logicThreads_;

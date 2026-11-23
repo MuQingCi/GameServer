@@ -61,6 +61,10 @@ LogicThread::LogicThread(uint32_t threadId,
 {
     LOG_INFO << "DB task scheduling: worker=" << threadId_
              << " policy=" << (cfg.activeIndex ? "active-index" : "legacy-scan");
+    playerService_.configureScatterSpawn(cfg.spawnScatter, cfg.spawnSpacing);
+    if (cfg.spawnScatter)
+        LOG_INFO << "scatter spawn enabled, worker=" << threadId_
+                 << " spacing=" << cfg.spawnSpacing;
     if (auto* diagnostics = bus.diagnostics())
         aoiService_.setDiagnostics(&diagnostics->aoi(threadId));
 }

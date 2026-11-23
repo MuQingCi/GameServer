@@ -35,6 +35,15 @@ SceneServer:
     timerTickMs: 50         # 时间轮步长 = 定时器精度
     timerWheelSlots: 256    # 槽数：覆盖范围 = 256 × 50ms = 12.8s
 
+    # 内部队列深度上限：0 = 无界（默认，保持既有行为）。
+    # 显式设置后，超限投递返回背压：网络层转 1011 busy、AOI 保留待推送下个 tick 重试。
+    # 推荐值按内存预算推导：maxDepth ≈ 队列可用内存 / (sizeof(Msg) + 平均 body)
+    #   例：单 worker 队列预留 64 MiB、平均消息 2 KiB → 约 32768
+    queue:
+        workerMaxDepth: 0   # 每条逻辑线程队列
+        netMaxDepth: 0      # 网络发送队列
+        dbMaxDepth: 0       # MySQL / Redis 任务队列
+
     db:
         activeIndex: true     #是否开启活跃索引来优化dbtask的扫描耗时
 

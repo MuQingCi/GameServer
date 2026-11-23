@@ -13,12 +13,26 @@
 #include <utility>
 #include <cstdlib>
 
+namespace
+{
+// 队列上限来自配置：0 = 无界（默认，保持既有行为）
+MsgBus::Limits MakeBusLimitsOf(const SceneConfig& cfg)
+{
+    MsgBus::Limits limits;
+    limits.workerMaxDepth = cfg.queueWorkerMaxDepth;
+    limits.netMaxDepth    = cfg.queueNetMaxDepth;
+    limits.dbMaxDepth     = cfg.queueDbMaxDepth;
+    return limits;
+}
+}  // namespace
+
 SceneServer::SceneServer(const SceneConfig& cfg)
     : cfg_(cfg), metrics_(cfg.logicThreadNum), luaDir_(cfg.luaDir)
 {
     // bus 最先创建：net/timer/db/logic 全都依赖它
     // Redis 分片数必须在这里定下来：MsgBus 的 Redis 队列数 = 分片数，而 db.redis 绑定层算出的分片索引会直接用作队列下标（不一致会越界/错投）
-    bus_ = std::make_unique<MsgBus>(cfg_.logicThreadNum, cfg_.zone.db.redis.ShardCount());
+    bus_ = std::make_unique<MsgBus>(cfg_.logicThreadNum, cfg_.zone.db.redis.ShardCount(),
+                                   MakeBusLimitsOf(cfg_), cfg_.netThreads);
     const char* diagnostics = std::getenv("SCENE_QUEUE_DIAGNOSTICS");
     if(diagnostics && std::string(diagnostics)=="1") 
         bus_->enableDiagnostics();
@@ -31,6 +45,13 @@ SceneServer::SceneServer(const SceneConfig& cfg)
 SceneServer::~SceneServer()
 {
     stop();
+}
+
+void SceneServer::StopNetShards()
+{
+    for (auto& shard : netServers_)
+        if (shard)
+            shard->stop();
 }
 
 bool SceneServer::start()
@@ -50,11 +71,16 @@ bool SceneServer::start()
     if (!monitoring_->prepare()) { stop(); return false; }
 
     // ---------------- 1. 网络线程 ----------------
-    netServer_ = std::make_unique<NetServer>(cfg_.net, *bus_);
-    if (!netServer_->start())
+    netServers_.reserve(cfg_.netThreads);
+    for (uint32_t i = 0; i < cfg_.netThreads; ++i)
     {
-        LOG_ERROR << "net server start failed";
-        return false;
+        auto shard = std::make_unique<NetServer>(cfg_.net, *bus_, i);
+        if (!shard->start())
+        {
+            LOG_ERROR << "net server start failed, shard=" << i;
+            return false;
+        }
+        netServers_.push_back(std::move(shard));
     }
 
     // ---------------- 2. 定时器线程（全场景唯一）----------------
@@ -62,7 +88,7 @@ bool SceneServer::start()
     if (!timerThread_->start())
     {
         LOG_ERROR << "timer thread start failed";
-        netServer_->stop();
+        StopNetShards();
         return false;
     }
 
@@ -74,7 +100,7 @@ bool SceneServer::start()
         {
             LOG_ERROR << "db threads start failed";
             timerThread_->stop();
-            netServer_->stop();
+            StopNetShards();
             return false;
         }
     }
@@ -110,7 +136,8 @@ bool SceneServer::start()
         {
             PeerConfig peer = configuredPeer;
             peer.channelId = channel;
-            if (!netServer_->connectTo(peer))
+            auto& shard = netServers_[channel % netServers_.size()];
+            if (!shard->connectTo(peer))
                 LOG_WARNING << "connect gateway failed: gatewayId=" << peer.gatewayId
                             << " channel=" << channel << " " << peer.addr << ":" << peer.port;
         }
@@ -136,8 +163,7 @@ void SceneServer::stop()
     monitoring_->stopPeriodic();
 
     // 逆序停止：先切断输入（网络），再停消费者（逻辑），最后停辅助线程
-    if (netServer_)
-        netServer_->stop();          // 不再有新消息进来
+    StopNetShards();              // 不再有新消息进来
 
     for (auto& lt : logicThreads_)
         if(lt) lt->requestDrain();
