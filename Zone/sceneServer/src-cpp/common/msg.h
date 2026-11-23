@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <sys/types.h>
 
@@ -168,6 +169,9 @@ namespace Method
     constexpr uint16_t AOI_VIEW_SNAPSHOT      = 8;
     constexpr uint16_t AOI_VIEW_RESYNC_REQ    = 9;
     constexpr uint16_t AOI_VIEW_RESYNC_ACK    = 10;
+    // worker 间批量事件帧：一帧携带同一发送方在一个 tick 内的全部事件，
+    // 与 AOI_ENTRY/MOVE/LEAVE 并存（旧方法号保留，解码失败可按单事件重试）。
+    constexpr uint16_t AOI_EVENT_BATCH        = 11;
 }   
 
 struct MsgHead
@@ -210,6 +214,9 @@ struct Msg
     bool diagnosticSaveTask = false; // 保存操作的身份，而非 SYS_FLUSH（加载操作也使用它）。
     MsgHead head;
     std::string body;
+    // 可选共享载荷：非空时优先于 body 使用，避免"一次编码、多目标发送"时的重复拷贝。
+    // 生命周期由 shared_ptr 保证；跨线程投递安全（内容不可变）。
+    std::shared_ptr<const std::string> sharedBody;
 };
 
 struct TimerOp // 定时器线程专用，不塞进 MsgBus

@@ -2,6 +2,7 @@
 
 #include "common/hash.h"
 #include "common/msg.h"
+#include "common/netRoute.h"
 #include "common/queue.h"
 #include "log/logger.h"
 
@@ -15,10 +16,28 @@ inline bool LessLoaded(size_t a, size_t b) { return a < b; }
 }  // namespace
 
 MsgBus::MsgBus(size_t numWorkers, size_t redisShards)
-    : net_queue_(std::make_unique<MsgQueue<Msg>>())
-    , mysql_queue_(std::make_unique<MsgQueue<Msg>>())
+    : MsgBus(numWorkers, redisShards, Limits{}, 1)
+{
+}
+
+MsgBus::MsgBus(size_t numWorkers, size_t redisShards, const Limits& limits)
+    : MsgBus(numWorkers, redisShards, limits, 1)
+{
+}
+
+MsgBus::MsgBus(size_t numWorkers, size_t redisShards, const Limits& limits, size_t netThreads)
+    : mysql_queue_(std::make_unique<MsgQueue<Msg>>(1024, limits.dbMaxDepth))
     , mysql_control_queue_(std::make_unique<MsgQueue<Msg>>())
 {
+    if (netThreads == 0)
+        netThreads = 1;
+    if (netThreads > netroute::kMaxThreads)
+        netThreads = netroute::kMaxThreads;
+    net_queues_.reserve(netThreads);
+    for (size_t i = 0; i < netThreads; ++i)
+        net_queues_.emplace_back(std::make_unique<MsgQueue<Msg>>(1024, limits.netMaxDepth));
+    net_wakeups_.resize(netThreads);
+
     if (numWorkers == 0)
         numWorkers = 1;  // 至少一个逻辑线程，否则后面取模会除零
     if (redisShards == 0)
@@ -28,14 +47,14 @@ MsgBus::MsgBus(size_t numWorkers, size_t redisShards)
     workerEnqueuedClassCounts_.reserve(numWorkers);
     for (size_t i = 0; i < numWorkers; ++i)
     {
-        worker_queues_.emplace_back(std::make_unique<MsgQueue<Msg>>());
+        worker_queues_.emplace_back(std::make_unique<MsgQueue<Msg>>(1024, limits.workerMaxDepth));
         workerEnqueuedClassCounts_.emplace_back(std::make_unique<std::array<std::atomic<uint64_t>, 2>>());
     }
 
     redis_queues_.reserve(redisShards);
     for (size_t i = 0; i < redisShards; ++i)
     {
-        redis_queues_.emplace_back(std::make_unique<MsgQueue<Msg>>());
+        redis_queues_.emplace_back(std::make_unique<MsgQueue<Msg>>(1024, limits.dbMaxDepth));
         redis_control_queues_.emplace_back(std::make_unique<MsgQueue<Msg>>());
     }
 }
@@ -127,23 +146,32 @@ DispatchResult MsgBus::broadcastToLogicExcept(WorkerId except, const Msg& m,
 DispatchResult MsgBus::sendToNet(Msg m)
 {
     m.diagnosticEnqueuedUs = diagnostics_ ? QueueDiagnostics::nowUs() : 0;
-    const bool ok = net_queue_->try_push(std::move(m));
+    // 出站只带 session：按 session 高 8 位找到拥有该连接的网络分片
+    const size_t idx = netroute::IndexOfClamped(m.head.session, static_cast<unsigned>(net_queues_.size()));
+    const bool ok = net_queues_[idx]->try_push(std::move(m));
     if (!ok)
     {
-        LOG_WARNING << "sendToNet: queue full";
+        LOG_WARNING << "sendToNet: queue full, net=" << idx;
         return diagnosticAdmission(numWorker(),DispatchResult::kBackpressure);
     }
 
     // 入队成功才唤醒：空队列时的唤醒是纯浪费
-    if (net_wakeup_)
-        net_wakeup_();
+    if (idx < net_wakeups_.size() && net_wakeups_[idx])
+        net_wakeups_[idx]();
 
     return diagnosticAdmission(numWorker(),DispatchResult::kAccepted);
 }
 
 void MsgBus::setNetWakeup(Wakeup cb)
 {
-    net_wakeup_ = std::move(cb);
+    for (auto& w : net_wakeups_)
+        w = cb;
+}
+
+void MsgBus::setNetWakeup(size_t netIndex, Wakeup cb)
+{
+    if (netIndex < net_wakeups_.size())
+        net_wakeups_[netIndex] = std::move(cb);
 }
 
 DispatchResult MsgBus::sendToDb(Msg m)
@@ -240,12 +268,34 @@ void MsgBus::recordDiagnosticPop(WorkerId wid, const Msg& out)
 
 bool MsgBus::tryPopNet(Msg& out)
 {
-    return diagnosticPop(numWorker(),out,net_queue_->try_pop(out));
+    for (auto& q : net_queues_)
+        if (q->try_pop(out))
+            return diagnosticPop(numWorker(),out,true);
+    return false;
 }
 
 bool MsgBus::waitPopNet(Msg& out, std::chrono::milliseconds timeoutMs)
 {
-    return diagnosticPop(numWorker(),out,net_queue_->wait_pop_for(out, timeoutMs));
+    // 兼容语义：先在 0 号分片等待，再扫描其余分片
+    if (net_queues_.empty())
+        return false;
+    if (net_queues_[0]->wait_pop_for(out, timeoutMs))
+        return diagnosticPop(numWorker(),out,true);
+    return tryPopNet(out);
+}
+
+bool MsgBus::tryPopNet(size_t netIndex, Msg& out)
+{
+    if (netIndex >= net_queues_.size())
+        return false;
+    return diagnosticPop(numWorker(),out,net_queues_[netIndex]->try_pop(out));
+}
+
+bool MsgBus::waitPopNet(size_t netIndex, Msg& out, std::chrono::milliseconds timeoutMs)
+{
+    if (netIndex >= net_queues_.size())
+        return false;
+    return diagnosticPop(numWorker(),out,net_queues_[netIndex]->wait_pop_for(out, timeoutMs));
 }
 
 bool MsgBus::tryPopDbMySql(Msg& out)
@@ -292,12 +342,22 @@ size_t MsgBus::depth(WorkerId wid) const
 {
     if (wid >= worker_queues_.size())
         return 0;
-    return worker_queues_[wid]->current_size();
+    return worker_queues_[wid]->depth();   // 有界时精确、无界时近似
 }
 
 size_t MsgBus::netDepth() const
 {
-    return net_queue_->current_size();
+    size_t total = 0;
+    for (const auto& q : net_queues_)
+        total += q->depth();
+    return total;
+}
+
+size_t MsgBus::netDepth(size_t netIndex) const
+{
+    if (netIndex >= net_queues_.size())
+        return 0;
+    return net_queues_[netIndex]->depth();
 }
 
 std::vector<size_t> MsgBus::workerDepths() const
@@ -305,7 +365,7 @@ std::vector<size_t> MsgBus::workerDepths() const
     std::vector<size_t> result;
     result.reserve(worker_queues_.size());
     for (const auto& queue : worker_queues_)
-        result.push_back(queue->current_size());
+        result.push_back(queue->depth());
     return result;
 }
 

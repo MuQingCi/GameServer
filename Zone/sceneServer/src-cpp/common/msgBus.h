@@ -58,7 +58,20 @@ public:
     using WorkerId = uint32_t;
     using PlayerId = uint64_t;
 
+    // 队列深度上限：0 = 无界（保持既有行为）。>0 时超限的投递返回 kBackpressure。
+    // 推荐值按内存预算推导：maxDepth ≈ 该队列可用内存 / (sizeof(Msg) + 平均 body)。
+    struct Limits
+    {
+        size_t workerMaxDepth = 0;   // 每条逻辑线程队列
+        size_t netMaxDepth = 0;      // 网络发送队列
+        size_t dbMaxDepth = 0;       // MySQL / Redis 任务队列
+    };
+
     explicit MsgBus(size_t numWorkers, size_t redisShards = 1);
+    // 带队列上限的重载；limits 各字段为 0 时等价于无界
+    MsgBus(size_t numWorkers, size_t redisShards, const Limits& limits);
+    // netThreads > 1 时启用多条网络队列：出站消息按 session 高 8 位路由到对应网络线程
+    MsgBus(size_t numWorkers, size_t redisShards, const Limits& limits, size_t netThreads);
     ~MsgBus();
     // 只能在启动生产者/消费者之前配置。
     void enableDiagnostics() { diagnostics_ = std::make_unique<QueueDiagnostics>(numWorker()+3+redisShardCount()); }
@@ -99,8 +112,12 @@ public:
     bool tryPopWorker(WorkerId wid, Msg& out);
     bool waitPopWorker(WorkerId wid, Msg& out, std::chrono::milliseconds timeoutMs);
 
+    // 聚合语义（测试/诊断用）：扫描所有网络队列
     bool tryPopNet(Msg& out);
     bool waitPopNet(Msg& out, std::chrono::milliseconds timeoutMs);
+    // 分片语义（网络线程用）：只访问自己那条队列
+    bool tryPopNet(size_t netIndex, Msg& out);
+    bool waitPopNet(size_t netIndex, Msg& out, std::chrono::milliseconds timeoutMs);
 
     bool tryPopDbMySql(Msg& out);
     bool waitPopDbMySql(Msg& out, std::chrono::milliseconds timeoutMs);
@@ -114,14 +131,17 @@ public:
     // 为什么要它：网络线程不能靠"超时轮询"取消息（无谓唤醒 + 延迟），
     // 而生产者（逻辑线程）也不该直接持有网络线程的 eventfd。
     using Wakeup = std::function<void()>;
-    void setNetWakeup(Wakeup cb);
+    void setNetWakeup(Wakeup cb);                          // 兼容：设置全部分片
+    void setNetWakeup(size_t netIndex, Wakeup cb);         // 网络分片专用
 
     // ---------------- 负载信息 ----------------
     size_t numWorker() const { return worker_queues_.size(); }
     size_t redisShardCount() const { return redis_queues_.size(); }
+    size_t netQueueCount() const { return net_queues_.size(); }
     // 队列积压深度（选线程的唯一依据：accept 时看不到"连接数"这种全局量）
     size_t depth(WorkerId wid) const;
-    size_t netDepth() const;
+    size_t netDepth() const;                    // 聚合（所有网络分片之和）
+    size_t netDepth(size_t netIndex) const;     // 单个网络分片
     std::vector<size_t> workerDepths() const;
     // 选一个最空闲的逻辑线程，同分用 tieBreak 哈希打散，避免羊群效应
     WorkerId leastLoadedWorker(uint64_t tieBreak) const;
@@ -136,7 +156,8 @@ private:
 
     std::vector<std::unique_ptr<std::array<std::atomic<uint64_t>, 2>>> workerEnqueuedClassCounts_;
 
-    std::unique_ptr<MsgQueue<Msg>> net_queue_;
+    // 网络分片：每个网络线程一条队列；出站消息按 session 高 8 位路由
+    std::vector<std::unique_ptr<MsgQueue<Msg>>> net_queues_;
     std::unique_ptr<MsgQueue<Msg>> mysql_queue_;
     // 每个 Redis 分片一条队列：慢 SQL（MySQL 通道）与 Redis 互不影响，
     // 分片之间也互不影响（一个实例慢不会拖累其它实例的读）
@@ -144,7 +165,7 @@ private:
     std::unique_ptr<MsgQueue<Msg>> mysql_control_queue_;
     std::vector<std::unique_ptr<MsgQueue<Msg>>> redis_control_queues_;
 
-    Wakeup net_wakeup_;
+    std::vector<Wakeup> net_wakeups_;
 };
 
 #endif
