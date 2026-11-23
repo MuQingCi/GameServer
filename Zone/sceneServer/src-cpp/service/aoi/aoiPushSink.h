@@ -3,6 +3,7 @@
 
 #include <string>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 using workerId = uint32_t;
@@ -33,6 +34,8 @@ struct AoiWorkerPublishRequest {
     uint16_t msgType = 0;
     std::vector<workerId> targets;
     std::string body;
+    // 可选共享载荷：多目标发送时避免逐个拷贝 body（同一批次可被多个目标复用）
+    std::shared_ptr<const std::string> sharedBody;
     uint16_t module = 0;
     uint16_t method = 0;
 };

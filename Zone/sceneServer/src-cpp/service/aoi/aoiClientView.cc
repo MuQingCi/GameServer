@@ -140,6 +140,139 @@ bool SendDelta(AoiService& service, EntityId observer, const ViewSendToken& toke
     AoiDiagnostics::Scope timing(service.diagnostics(), AoiDiagnostics::Stage::Commit);
     return service.views().commitAccepted(observer, token, accepted);
 }
+
+// 只遍历本帧发生变化的实体，O(Δ) 而非 O(V)。
+// classify == false 表示"视野结构未变"：此时只可能是 moved，省掉逐实体格判定；
+// classify == true 表示结构已变：按实体当前所在格判定 entered / moved / left。
+bool SendDeltaByDirty(AoiService& service, EntityId observer, const ViewSendToken& token,
+                      const ViewBaseline& baseline, bool classify)
+{
+    gs::SCPushViewDelta delta;
+    delta.set_view_seq(token.nextViewSeq);
+    std::vector<AcceptedPush> accepted;
+    // 观察者所在格在整帧内不变，提到循环外，避免每个变化实体都做一次哈希查找
+    const auto observerCell = classify ? service.CellOf(observer) : std::nullopt;
+    if (classify && !observerCell)
+        return false;
+    {
+        AoiDiagnostics::Scope timing(service.diagnostics(), AoiDiagnostics::Stage::BuildDiff);
+        if (!classify)
+        {
+            // 结构未变 => 无 entered/left，只需找版本变化者。
+            // 关键：取"视野大小 V"与"变化实体数 Δ"中较小的一侧扫描，
+            // 否则 sparse 场景（V 很小、Δ 很大）会比原来的 O(V) 更慢。
+            const auto& dirty = service.dirtyEntities();
+            if (baseline.size() <= dirty.size())
+            {
+                for (const auto& kv : baseline)
+                {
+                    const EntityId id = kv.first;
+                    if (id == observer)
+                        continue;
+                    const auto* entity = service.FindEntity(id);
+                    if (entity == nullptr)
+                        continue;
+                    if (kv.second.entityGeneration != entity->entityGeneration)
+                        continue;
+                    if (kv.second.spatialVersion == entity->spatialVersion)
+                        continue;
+                    FillProto(*entity, delta.add_moved());
+                    accepted.push_back({AoiMsgKind::kMove, id,
+                                        {entity->kind, entity->businessId, entity->entityGeneration,
+                                         entity->spatialVersion}});
+                }
+            }
+            else
+            {
+                for (EntityId id : dirty)
+                {
+                    if (id == observer)
+                        continue;
+                    const auto* entity = service.FindEntity(id);
+                    if (entity == nullptr)
+                        continue;
+                    const auto old = baseline.find(id);
+                    if (old == baseline.end())
+                        continue;
+                    if (old->second.entityGeneration != entity->entityGeneration)
+                        continue;
+                    if (old->second.spatialVersion == entity->spatialVersion)
+                        continue;
+                    FillProto(*entity, delta.add_moved());
+                    accepted.push_back({AoiMsgKind::kMove, id,
+                                        {entity->kind, entity->businessId, entity->entityGeneration,
+                                         entity->spatialVersion}});
+                }
+            }
+        }
+        else
+        {
+            for (EntityId id : service.dirtyEntities())
+            {
+                if (id == observer)
+                    continue;
+                const auto old = baseline.find(id);
+                const auto* entity = service.FindEntity(id);
+                const bool visible =
+                    entity != nullptr && service.CellVisibleFrom(*observerCell, entity->cellIdx);
+
+                if (visible)
+                {
+                    if (old == baseline.end() ||
+                        old->second.entityGeneration != entity->entityGeneration)
+                    {
+                        FillProto(*entity, delta.add_entered());
+                        accepted.push_back({AoiMsgKind::kEntry, id,
+                                            {entity->kind, entity->businessId, entity->entityGeneration,
+                                             entity->spatialVersion}});
+                    }
+                    else if (old->second.spatialVersion != entity->spatialVersion)
+                    {
+                        FillProto(*entity, delta.add_moved());
+                        accepted.push_back({AoiMsgKind::kMove, id,
+                                            {entity->kind, entity->businessId, entity->entityGeneration,
+                                             entity->spatialVersion}});
+                    }
+                }
+                else if (old != baseline.end())
+                {
+                    auto* left = delta.add_left();
+                    left->set_entity_id(id);
+                    left->set_business_id(old->second.businessId);
+                    left->set_entity_kind(static_cast<uint32_t>(old->second.kind));
+                    left->set_entity_generation(old->second.entityGeneration);
+                    left->set_spatial_version(old->second.spatialVersion);
+                    left->set_x(old->second.x);
+                    left->set_y(old->second.y);
+                    left->set_dir(old->second.dir);
+                    accepted.push_back({AoiMsgKind::kLeave, id, old->second});
+                }
+            }
+        }
+    }
+    if (service.diagnostics())
+        service.diagnostics()->add(AoiDiagnostics::Counter::PushEntities, accepted.size());
+
+    if (accepted.empty())
+        return true;
+
+    AoiClientPushRequest request;
+    request.clientViewEpoch = token.clientViewEpoch;
+    request.module = Module::AOI;
+    request.method = Method::AOI_VIEW_DELTA;
+    {
+        AoiDiagnostics::Scope timing(service.diagnostics(), AoiDiagnostics::Stage::Serialize);
+        request.body = delta.SerializeAsString();
+    }
+    const auto observerPlayerId = service.BusinessIdOf(observer);
+    if (!observerPlayerId)
+        return false;
+    request.observerPlayerId = *observerPlayerId;
+    if (service.pushToClient(request) != AoiPushResult::kAccepted)
+        return false;
+    AoiDiagnostics::Scope timing(service.diagnostics(), AoiDiagnostics::Stage::Commit);
+    return service.views().commitAccepted(observer, token, accepted);
+}
 }
 
 bool ProcessAoiClientObserver(AoiService& service, EntityId observer)
@@ -148,13 +281,13 @@ bool ProcessAoiClientObserver(AoiService& service, EntityId observer)
     if (!token)
         return false;
 
-    const auto current = CurrentView(service, observer);
-    const auto* baseline=service.views().borrowCommittedBaseline(observer);
+    const auto* baseline = service.views().borrowCommittedBaseline(observer);
     if (baseline == nullptr)
         return false;
 
     if (service.views().needResync(observer))
     {
+        const auto current = CurrentView(service, observer);
         const auto frozen = [&] {
             AoiDiagnostics::Scope timing(service.diagnostics(), AoiDiagnostics::Stage::BuildDiff);
             return ToBaseline(current);
@@ -212,9 +345,27 @@ bool ProcessAoiClientObserver(AoiService& service, EntityId observer)
             service.views().markSnapshotPartAccepted(*snapshot, part);
         }
         AoiDiagnostics::Scope timing(service.diagnostics(), AoiDiagnostics::Stage::Commit);
-        return service.views().commitSnapshot(*snapshot);
+        const bool ok = service.views().commitSnapshot(*snapshot);
+        // 快照的基线来自刚刚构建的完整视野，成功后同步结构缓存
+        if (ok)
+            service.RefreshStructureCache(observer);
+        return ok;
     }
 
-    // SendDelta 在调用输出回调或提交之前完成所有基线读取。
-    return SendDelta(service, observer, *token, current, *baseline);
+    // 只有"观察者自身跨格"与"批量恢复"会有一批实体离开视野却没有对应事件，必须全量重建
+    if (service.ForceFullRebuild() || service.ObserverCellChanged(observer))
+    {
+        const auto current = CurrentView(service, observer);
+        const bool ok = SendDelta(service, observer, *token, current, *baseline);
+        if (ok)
+            service.RefreshStructureCache(observer);
+        return ok;
+    }
+
+    // 其余情况一律 O(Δ)：结构未变只发 moved；结构已变则按实体当前所在格分类
+    const bool structureSame = service.StructureUnchanged(observer);
+    const bool ok = SendDeltaByDirty(service, observer, *token, *baseline, !structureSame);
+    if (ok && !structureSame)
+        service.RefreshStructureCache(observer);
+    return ok;
 }

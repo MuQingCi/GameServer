@@ -57,45 +57,27 @@ const AoiCell& AoiGrid::getCell(uint32_t cellIdx) const
 
 std::vector<uint32_t> AoiGrid::getWatchCellIdx(Position x, Position y) const
 {
-    std::vector<uint32_t> result;
-
     //根据位置算出所在格子索引
     const auto optIdx = TryCellOf(x, y);
     if (!optIdx.has_value())
-        return result;
-    
-    const uint32_t centerCol = *optIdx % cols_;
-    const uint32_t centerRow = *optIdx / cols_;
+        return {};
+    return watchCellsOfCell(*optIdx);
+}
 
-    const int32_t r      = static_cast<int32_t>(r_);
-    const int32_t colsI  = static_cast<int32_t>(cols_);
-    const int32_t rowsI  = static_cast<int32_t>(rows_);
-
-    int32_t col0 = static_cast<int32_t>(centerCol) - r; //左边界
-    int32_t col1 = static_cast<int32_t>(centerCol) + r; //右边界
-    int32_t row0 = static_cast<int32_t>(centerRow) - r; //上边界
-    int32_t row1 = static_cast<int32_t>(centerRow) + r; //下边界
-
-    // 裁剪到网格范围
-    if (col0 < 0)       col0 = 0;
-    if (row0 < 0)       row0 = 0;
-    if (col1 >= colsI)  col1 = colsI - 1;
-    if (row1 >= rowsI)  row1 = rowsI - 1;
-
-    // 预留空间，避免多次扩容
-    const size_t count = static_cast<size_t>(col1 - col0 + 1) *
-                         static_cast<size_t>(row1 - row0 + 1);
-    result.reserve(count);
-
-    for (int32_t j = row0; j <= row1; ++j)
-    {
-        for (int32_t i = col0; i <= col1; ++i)
-        {
-            result.push_back(static_cast<uint32_t>(j) * cols_ + static_cast<uint32_t>(i));
-        }
-    }
+std::vector<uint32_t> AoiGrid::watchCellsOfCell(uint32_t cellIdx) const
+{
+    std::vector<uint32_t> result;
+    result.reserve(static_cast<size_t>(2 * r_ + 1) * static_cast<size_t>(2 * r_ + 1));
+    forEachWatchCellOfCell(cellIdx, [&](uint32_t idx, uint32_t) { result.push_back(idx); });
     return result;
-}   
+}
+
+uint32_t AoiGrid::membersRev(uint32_t cell) const
+{
+    if (cell >= cells_.size())
+        return 0;
+    return cells_[cell].membersRev_;
+}
 
 
 bool AoiGrid::visible(uint32_t cellA, uint32_t cellB) const
@@ -121,7 +103,13 @@ void AoiGrid::addEntity(EntityId entityId, uint32_t cell)
 {
     if (cell >= cells_.size())
         return;
-    cells_[cell].entys_.push_back(entityId);
+    auto& target = cells_[cell];
+    // 幂等：重复加入不制造重复条目，也不触发无谓的结构变更
+    if (target.entPos_.find(entityId) != target.entPos_.end())
+        return;
+    target.entPos_.emplace(entityId, static_cast<uint32_t>(target.entys_.size()));
+    target.entys_.push_back(entityId);
+    ++target.membersRev_;   // 成员集合变化：让观察者知道需要重建
 }
 
 void AoiGrid::removeEntity(EntityId entityId, uint32_t cell)
@@ -129,9 +117,19 @@ void AoiGrid::removeEntity(EntityId entityId, uint32_t cell)
     if (cell >= cells_.size())
         return;
 
-    auto& ents = cells_[cell].entys_;
-    // remove-erase 惯用法：删除所有等于 entityId 的元素
-    ents.erase(std::remove(ents.begin(), ents.end(), entityId), ents.end());
+    auto& target = cells_[cell];
+    const auto it = target.entPos_.find(entityId);
+    if (it == target.entPos_.end())
+        return;   // 幂等删除不触发无谓重建
+
+    // O(1) swap-pop：把末尾元素挪到被删位置，避免 std::remove 的尾部整体搬移
+    const uint32_t idx = it->second;
+    const EntityId last = target.entys_.back();
+    target.entys_[idx] = last;
+    target.entPos_[last] = idx;
+    target.entys_.pop_back();
+    target.entPos_.erase(it);
+    ++target.membersRev_;
 }
 
 
@@ -139,7 +137,11 @@ void AoiGrid::addWatcher(EntityId observerId, uint32_t cell)
 {
     if (cell >= cells_.size())
         return;
-    cells_[cell].watchers_.push_back(observerId);
+    auto& target = cells_[cell];
+    if (target.watcherPos_.find(observerId) != target.watcherPos_.end())
+        return;   // 幂等
+    target.watcherPos_.emplace(observerId, static_cast<uint32_t>(target.watchers_.size()));
+    target.watchers_.push_back(observerId);
 }
 
 void AoiGrid::removeWatcher(EntityId observerId, uint32_t cell)
@@ -147,8 +149,17 @@ void AoiGrid::removeWatcher(EntityId observerId, uint32_t cell)
     if (cell >= cells_.size())
         return;
 
-    auto& ws = cells_[cell].watchers_;
-    ws.erase(std::remove(ws.begin(), ws.end(), observerId), ws.end());
+    auto& target = cells_[cell];
+    const auto it = target.watcherPos_.find(observerId);
+    if (it == target.watcherPos_.end())
+        return;   // 幂等
+
+    const uint32_t idx = it->second;
+    const EntityId last = target.watchers_.back();
+    target.watchers_[idx] = last;
+    target.watcherPos_[last] = idx;
+    target.watchers_.pop_back();
+    target.watcherPos_.erase(it);
 }
 
 

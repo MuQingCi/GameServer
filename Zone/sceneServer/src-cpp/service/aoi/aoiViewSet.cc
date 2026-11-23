@@ -116,6 +116,14 @@ const ObserverSnapshot* AoiViewSet::findObserver(EntityId observerId) const
     return &(vIt->second);
 }
 
+ObserverSnapshot* AoiViewSet::findObserverMutable(EntityId observerId)
+{
+    auto vIt = views_.find(observerId);
+    if(vIt == views_.end())
+        return nullptr;
+    return &(vIt->second);
+}
+
 const SentEntityState* AoiViewSet::findSentState(EntityId observerId, EntityId targetId) const
 {
     auto vIt = views_.find(observerId);
@@ -191,6 +199,15 @@ bool AoiViewSet::commitAccepted(EntityId observerId,
     bool ok = true;
     for(auto& push : items)
     {
+        // 必须先校验再记 undo：非法入参不得进入基线，也不应产生回滚记录
+        if(push.targetId == 0 ||
+           (push.state.kind != EntityKind::kPlayer && push.state.kind != EntityKind::kMonster &&
+            push.state.kind != EntityKind::kNpc && push.state.kind != EntityKind::kDrop))
+        {
+            ok = false;
+            break;
+        }
+
         const auto it = vIt->second.committedState_.find(push.targetId);
         undoSearch_.push_back(Undo{
                                  push.targetId,
@@ -207,7 +224,8 @@ bool AoiViewSet::commitAccepted(EntityId observerId,
 
     if(!ok)
     {
-        for(auto rit = undoSearch_.begin(); rit != undoSearch_.end(); ++rit)
+        // 逆序回滚：同一 targetId 在一帧内出现多次时，正序会把中间态当成原始态
+        for(auto rit = undoSearch_.rbegin(); rit != undoSearch_.rend(); ++rit)
         {
             if(rit->hasOld)
                 vIt->second.committedState_[rit->eId] = rit->old;

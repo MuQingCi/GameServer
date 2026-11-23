@@ -132,8 +132,54 @@ inline bool DecodeEvent(const std::string& s, AoiEvent& out)
     return true;
 }
 
-inline uint16_t EventMethod(AoiMsgKind kind) 
+// ---------------- 批量帧（worker 间）----------------
+// 布局：version u16 | count u32 | [WriteEvent × count]
+// 每个事件占 kEventBytes-2 = 60 字节，长度可精确校验。
+constexpr size_t kMaxBatchEvents = 8192;
+
+inline bool EncodeBatch(const std::vector<AoiEvent>& events, std::string& out)
 {
+    if (events.empty() || events.size() > kMaxBatchEvents)
+        return false;
+    std::string s;
+    s.reserve(2 + 4 + events.size() * (kEventBytes - 2));
+    PutU16(s, kVersion);
+    PutU32(s, static_cast<uint32_t>(events.size()));
+    for (const auto& e : events)
+    {
+        if (!ValidEvent(e))
+            return false;
+        WriteEvent(s, e);
+    }
+    out.swap(s);
+    return true;
+}
+
+inline bool DecodeBatch(const std::string& s, std::vector<AoiEvent>& out)
+{
+    Reader r{s};
+    uint64_t v;
+    if (!r.read(2, v) || v != kVersion || !r.read(4, v))
+        return false;
+    if (v == 0 || v > kMaxBatchEvents)
+        return false;
+    const size_t count = static_cast<size_t>(v);
+    if (s.size() - r.pos != count * (kEventBytes - 2))
+        return false;
+
+    out.clear();
+    out.reserve(count);
+    for (size_t i = 0; i < count; ++i)
+    {
+        AoiEvent e;
+        if (!ReadEvent(r, e))
+            return false;
+        out.push_back(e);
+    }
+    return r.pos == s.size();
+}
+
+inline uint16_t EventMethod(AoiMsgKind kind) {
     switch(kind) 
     {
     case AoiMsgKind::kEntry: return Method::AOI_ENTRY;

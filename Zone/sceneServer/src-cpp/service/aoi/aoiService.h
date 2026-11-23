@@ -87,6 +87,24 @@ public:
     std::optional<uint64_t> BusinessIdOf(EntityId id) const;
     bool IsEntityActive(EntityId id) const;
 
+    // ---- 增量推送（A2）：视野结构未变时只推送本帧变化的实体 ----
+    // 本帧成功应用过事件的实体集合；由 Replica 记录，OnTick 在全部观察者处理成功后清空。
+    const std::unordered_set<EntityId>& dirtyEntities() const { return dirtyEntities_; }
+    // 只读查询实体当前空间状态；不存在返回 nullptr
+    const AoiEntity* FindEntity(EntityId id) const;
+    // 观察者的可见成员集合自上次构建以来是否未变化
+    bool StructureUnchanged(EntityId observer) const;
+    // 观察者自身所在格是否与缓存不同：跨格会有一批实体离开视野且没有事件，必须全量重建
+    bool ObserverCellChanged(EntityId observer) const;
+    // 实体当前所在格；不存在返回 nullopt
+    std::optional<uint32_t> CellOf(EntityId observer) const;
+    // 两个格是否互相可见（切比雪夫距离 <= r）：O(1)，不分配
+    bool CellVisibleFrom(uint32_t observerCell, uint32_t cellIdx) const;
+    // 本 tick 是否因批量恢复（owner 快照）而要求全量重建
+    bool ForceFullRebuild() const { return forceFullRebuild_; }
+    // 在成功构建/提交视野后刷新结构缓存
+    void RefreshStructureCache(EntityId observer);
+
     std::vector<workerId> OwnersNeedingSnapshot() const;
 
 private:
@@ -97,7 +115,8 @@ private:
     ApplyResult ApplyLocal(const AoiEvent& ev);
     void FlushRemoteMoves();
     void RetryPublishes();
-    void ProcessObservers();
+    // 返回 false 表示仍有观察者未成功处理（此时必须保留 dirtyEntities_ 以便下个 tick 重试）
+    bool ProcessObservers();
     bool ValidPosition(const Player& p) const;
 
     workerId wId_;
@@ -112,6 +131,11 @@ private:
     std::unordered_map<uint64_t, LocalIdentity> identities_;
     
     std::unordered_set<EntityId> dirtyObservers_;
+    // 本帧发生空间/生命周期变化的实体（成功应用才记录）
+    std::unordered_set<EntityId> dirtyEntities_;
+    // owner 快照恢复会批量替换实体，且被移除的实体没有逐条事件；
+    // 置位后本 tick 全部观察者走全量重建，避免客户端残留幽灵实体。
+    bool forceFullRebuild_ = false;
     std::unordered_map<EntityId, AoiEvent> pendingRemoteMoves_;
     std::unordered_set<workerId> ownersNeedingSnapshot_;
     std::vector<PublishTask> pendingPublishes_;

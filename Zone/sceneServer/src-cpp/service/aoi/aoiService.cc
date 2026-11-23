@@ -1,4 +1,5 @@
 #include "service/aoi/aoiService.h"
+#include "service/aoi/aoiWire.h"
 #include "player/player.h"
 #include <algorithm>
 #include <limits>
@@ -161,7 +162,7 @@ AoiService::RemoteResult AoiService::onRemoteEntityEvent(workerId sender, const 
     }
     
     //3.远端消息非Move则直接应用，根据结果执行相应处理
-    const auto result = replica_.Apply(ev, AoiReplica::Source::kRemote, dirtyObservers_);
+    const auto result = replica_.Apply(ev, AoiReplica::Source::kRemote, dirtyObservers_, &dirtyEntities_);
 
     if(result == ApplyResult::kApplied) 
     {
@@ -188,6 +189,8 @@ AoiService::ApplyResult AoiService::ApplyOwnerSnapshot(workerId sender, const Ao
     const auto result = replica_.ApplyOwnerSnapshot(snap, dirtyObservers_);
     if(result == ApplyResult::kApplied) 
     {
+        // 快照批量替换实体，被移除者没有逐条事件：本 tick 强制全量重建
+        forceFullRebuild_ = true;
         for(auto it = pendingRemoteMoves_.begin(); it != pendingRemoteMoves_.end();) 
         {
             if(it->second.ownerThreadId == sender && it->second.ownerSeq <= snap.seq)
@@ -283,7 +286,28 @@ void AoiService::OnTick(int64_t now)
     ++tickCount_;
     FlushRemoteMoves();
     RetryPublishes();
-    ProcessObservers();
+    if (ProcessObservers())
+    {
+        // 全部观察者都已成功处理：本帧变化集与"强制全量重建"标记都可以清除
+        dirtyEntities_.clear();
+        forceFullRebuild_ = false;
+        return;
+    }
+
+    // 存在推送失败的观察者：保留变化集，下个 tick 用并集重试，避免该实体的更新永远不会再被推送。
+    // 若持续失败导致集合无界增长，则退回"全量重同步"兜底，而不是无限累积。
+    constexpr size_t kDirtyEntityHardLimit = 65536;
+    if (dirtyEntities_.size() > kDirtyEntityHardLimit)
+    {
+        for (auto observer : dirtyObservers_)
+        {
+            const auto* st = viewSet_.findObserver(observer);
+            if (st != nullptr)
+                viewSet_.markNeedResync(observer, st->clientViewEpoch);
+        }
+        dirtyEntities_.clear();
+        forceFullRebuild_ = false;
+    }
 }
 
 
@@ -323,6 +347,78 @@ std::optional<uint64_t> AoiService::BusinessIdOf(EntityId id) const
 std::vector<workerId> AoiService::OwnersNeedingSnapshot() const
 {
     return {ownersNeedingSnapshot_.begin(), ownersNeedingSnapshot_.end()};
+}
+
+const AoiEntity* AoiService::FindEntity(EntityId id) const
+{
+    return replica_.findById(id);
+}
+
+bool AoiService::StructureUnchanged(EntityId observer) const
+{
+    const auto* st = viewSet_.findObserver(observer);
+    if (st == nullptr || st->structCells.empty() ||
+        st->structCells.size() != st->structRevs.size())
+        return false;
+
+    const auto* ent = replica_.findById(observer);
+    // 观察者自身跨格 => 视野格集合变了，必须重建
+    if (ent == nullptr || ent->cellIdx != st->structCenterCell)
+        return false;
+
+    for (size_t i = 0; i < st->structCells.size(); ++i)
+    {
+        if (replica_.cellMembersRev(st->structCells[i]) != st->structRevs[i])
+            return false;
+    }
+    return true;
+}
+
+bool AoiService::ObserverCellChanged(EntityId observer) const
+{
+    const auto* st = viewSet_.findObserver(observer);
+    if (st == nullptr || st->structCells.empty())
+        return true;
+    const auto* ent = replica_.findById(observer);
+    if (ent == nullptr)
+        return true;
+    return ent->cellIdx != st->structCenterCell;
+}
+
+std::optional<uint32_t> AoiService::CellOf(EntityId observer) const
+{
+    const auto* ent = replica_.findById(observer);
+    if (ent == nullptr)
+        return std::nullopt;
+    return ent->cellIdx;
+}
+
+bool AoiService::CellVisibleFrom(uint32_t observerCell, uint32_t cellIdx) const
+{
+    return replica_.cellVisible(observerCell, cellIdx);
+}
+
+void AoiService::RefreshStructureCache(EntityId observer)
+{
+    auto* st = viewSet_.findObserverMutable(observer);
+    if (st == nullptr)
+        return;
+
+    const auto* ent = replica_.findById(observer);
+    if (ent == nullptr)
+    {
+        st->structCenterCell = 0xFFFFFFFFu;
+        st->structCells.clear();
+        st->structRevs.clear();
+        return;
+    }
+
+    st->structCenterCell = ent->cellIdx;
+    st->structCells = replica_.watchCellsOfCell(ent->cellIdx);
+    st->structRevs.clear();
+    st->structRevs.reserve(st->structCells.size());
+    for (uint32_t c : st->structCells)
+        st->structRevs.push_back(replica_.cellMembersRev(c));
 }
 
 
@@ -387,7 +483,7 @@ AoiService::ApplyResult AoiService::ApplyLocal(const AoiEvent& event)
     ev.ownerSeq = ownerSeq_ + 1;
     pendingPublishes_.push_back({ev, hooks_.publishTargets});
 
-    const auto result = replica_.Apply(ev, AoiReplica::Source::kLocal, dirtyObservers_);
+    const auto result = replica_.Apply(ev, AoiReplica::Source::kLocal, dirtyObservers_, &dirtyEntities_);
     //应用失败则回退到执行前的状态
     if(result != ApplyResult::kApplied) 
         pendingPublishes_.pop_back();
@@ -406,7 +502,7 @@ void AoiService::FlushRemoteMoves()
     pendingRemoteMoves_.clear();
     for(const auto& kv : pending) 
     {
-        const auto result = replica_.Apply(kv.second, AoiReplica::Source::kRemote, dirtyObservers_);
+        const auto result = replica_.Apply(kv.second, AoiReplica::Source::kRemote, dirtyObservers_, &dirtyEntities_);
         if(result == ApplyResult::kNeedSnapshot) 
             ownersNeedingSnapshot_.insert(kv.second.ownerThreadId);
     }
@@ -415,49 +511,113 @@ void AoiService::FlushRemoteMoves()
 void AoiService::RetryPublishes()
 {
     AoiDiagnostics::Scope timing(diagnostics_, AoiDiagnostics::Stage::RemotePublish);
-    if(!hooks_.encodeEvent) 
+    // encodeEvent 在这里只作为"是否启用跨 worker 发布"的开关；
+    // 实际编码改为批量帧：一个 tick 的全部事件只编码一次。
+    if(!hooks_.encodeEvent || pendingPublishes_.empty())
         return;
-    for(auto it = pendingPublishes_.begin(); it != pendingPublishes_.end();) 
-    {
-        AoiWorkerPublishRequest request;
-        if(!hooks_.encodeEvent(it->event, request)) 
-        { 
-            ++it; 
-            continue; 
-        }
-        request.targets = it->remaining;
 
-        const auto result = sink_.publishToWorkers(request);
-        std::vector<workerId> failed;
-        for(auto target : it->remaining) 
-        {
-            const auto delivery = std::find_if(result.deliveries.begin(), result.deliveries.end(),
-                [&](const WorkerDeliveryResult& r) { 
-                    return r.target == target; });
-            if(delivery == result.deliveries.end() || !delivery->accepted) 
-                failed.push_back(target);
-        }
-        it->remaining.swap(failed);
-        if(it->remaining.empty()) 
+    // 1) 收齐本 tick 需要发布的事件，一次性编码
+    std::vector<AoiEvent> events;
+    events.reserve(pendingPublishes_.size());
+    for(const auto& task : pendingPublishes_)
+        events.push_back(task.event);
+
+    std::string batchBody;
+    if(!AoiWire::EncodeBatch(events, batchBody))
+        return;   // 编码失败：保留任务，下个 tick 重试
+
+    // 2) 目标集合 = 各任务剩余目标的并集
+    std::unordered_set<workerId> targetSet;
+    for(const auto& task : pendingPublishes_)
+        targetSet.insert(task.remaining.begin(), task.remaining.end());
+    if(targetSet.empty())
+    {
+        pendingPublishes_.clear();
+        return;
+    }
+
+    AoiWorkerPublishRequest request;
+    request.msgType = MSGTYPE_SERVICE;
+    request.module = Module::AOI;
+    request.method = Method::AOI_EVENT_BATCH;
+    // 按 hooks_.publishTargets 的固定顺序输出，保证跨 worker 的行为可复现
+    request.targets.reserve(targetSet.size());
+    for(workerId target : hooks_.publishTargets)
+    {
+        const auto it = targetSet.find(target);
+        if(it == targetSet.end()) continue;
+        request.targets.push_back(target);
+        targetSet.erase(it);
+    }
+    // 兜底：若存在不在 publishTargets 中的剩余目标（理论上不会），追加在后面
+    for(workerId target : targetSet)
+        request.targets.push_back(target);
+
+    // 关键：一次编码，多目标共享；不再逐目标拷贝 body
+    request.sharedBody = std::make_shared<const std::string>(std::move(batchBody));
+
+    const auto result = sink_.publishToWorkers(request);
+
+    // 3) 记录失败目标，并据此收缩每个任务的 remaining
+    std::unordered_set<workerId> failed;
+    for(workerId target : request.targets)
+    {
+        const auto delivery = std::find_if(result.deliveries.begin(), result.deliveries.end(),
+            [&](const WorkerDeliveryResult& r) { return r.target == target; });
+        if(delivery == result.deliveries.end() || !delivery->accepted)
+            failed.insert(target);
+    }
+
+    for(auto it = pendingPublishes_.begin(); it != pendingPublishes_.end();)
+    {
+        std::vector<workerId> keep;
+        keep.reserve(it->remaining.size());
+        for(workerId target : it->remaining)
+            if(failed.count(target) != 0) keep.push_back(target);
+        it->remaining.swap(keep);
+        if(it->remaining.empty())
             it = pendingPublishes_.erase(it);
-        else ++it;
+        else
+            ++it;
     }
 }
 
-void AoiService::ProcessObservers()
+bool AoiService::ProcessObservers()
 {
     if(!hooks_.processObserver) 
-        return;
+        return true;
+    // 推送 LOD：本轮是否为"推送轮次"。间隔 1 = 每轮都推（默认，等价关闭）。
+    const bool lodSkipRound = aoiConfig_.lodPushInterval > 1 &&
+                              (tickCount_ % aoiConfig_.lodPushInterval) != 0;
+    bool allProcessed = true;
     for(auto observer : viewSet_.forEachObserver()) 
     {
         if(!dirtyObservers_.contains(observer) && !viewSet_.hasPending(observer) &&
            !viewSet_.needResync(observer)) 
             continue;
+
+        // 视野足够大且本轮不是推送轮次：先跳过。
+        // 跳过时**不擦除脏标记**，下一轮由"基线差分"把累积变化一次带出，因此不会丢更新；
+        // 代价是该观察者的 AOI 更新粒度变为 lodPushInterval × tickMs。
+        // 重同步（新进场/客户端请求）永远不跳过，避免进场时黑屏。
+        if (lodSkipRound && !viewSet_.needResync(observer))
+        {
+            const auto* st = viewSet_.findObserver(observer);
+            if (st != nullptr && st->committedState_.size() >= aoiConfig_.lodMinViewSize)
+            {
+                allProcessed = false;   // 保留 dirtyEntities_，供下一轮差分使用
+                continue;
+            }
+        }
+
         AoiDiagnostics::Scope timing(diagnostics_, AoiDiagnostics::Stage::ObserverPass);
         if (diagnostics_) diagnostics_->add(AoiDiagnostics::Counter::Observers);
         if(hooks_.processObserver(*this, observer)) 
             dirtyObservers_.erase(observer);
+        else
+            allProcessed = false;   // 保留 dirtyEntities_，下个 tick 用并集重试
     }
+    return allProcessed;
 }
 
 bool AoiService::ValidPosition(const Player& p) const 

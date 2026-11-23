@@ -15,6 +15,9 @@ inline Result Dispatch(AoiService& service, workerId self, size_t workerCount, c
        sender >= workerCount || sender == self)
         return Result::kRejected;
 
+    // 进程内投递可能走共享载荷（不拷贝 body），两者取其一
+    const std::string& body = msg.sharedBody ? *msg.sharedBody : msg.body;
+
     switch(msg.head.Method) 
     {
     case Method::AOI_ENTRY:
@@ -22,23 +25,39 @@ inline Result Dispatch(AoiService& service, workerId self, size_t workerCount, c
     case Method::AOI_LEAVE: 
     {
         AoiEvent event;
-        if(!AoiWire::DecodeEvent(msg.body, event) || event.ownerThreadId != sender ||
+        if(!AoiWire::DecodeEvent(body, event) || event.ownerThreadId != sender ||
            AoiWire::EventMethod(event.msgKind) != msg.head.Method)
             return Result::kRejected;
         return service.onRemoteEntityEvent(sender, event) == AoiService::RemoteResult::kRejected
             ? Result::kRejected : Result::kHandled;
     }
+    case Method::AOI_EVENT_BATCH:
+    {
+        std::vector<AoiEvent> events;
+        if(!AoiWire::DecodeBatch(body, events))
+            return Result::kRejected;
+        bool rejected = false;
+        for(const auto& event : events)
+        {
+            // 信封一致性：任一事件声明错误则整帧拒绝，不做部分应用
+            if(event.ownerThreadId != sender || AoiWire::EventMethod(event.msgKind) == 0)
+                return Result::kRejected;
+            if(service.onRemoteEntityEvent(sender, event) == AoiService::RemoteResult::kRejected)
+                rejected = true;
+        }
+        return rejected ? Result::kRejected : Result::kHandled;
+    }
     case Method::AOI_OWNER_SNAPSHOT: 
     {
         AoiOwnerSnapshot snapshot{};
-        if(!AoiWire::DecodeSnapshot(msg.body, snapshot) || snapshot.ownerWokerId != sender)
+        if(!AoiWire::DecodeSnapshot(body, snapshot) || snapshot.ownerWokerId != sender)
             return Result::kRejected;
         const auto result = service.ApplyOwnerSnapshot(sender, snapshot);
         return result == AoiService::ApplyResult::kApplied || result == AoiService::ApplyResult::kIgnored
             ? Result::kHandled : Result::kRejected;
     }
     case Method::AOI_OWNER_SNAPSHOT_REQ:
-        return AoiWire::ValidSnapshotRequest(msg.body) ? Result::kSnapshotRequested : Result::kRejected;
+        return AoiWire::ValidSnapshotRequest(body) ? Result::kSnapshotRequested : Result::kRejected;
     default:
         return Result::kRejected;
     }

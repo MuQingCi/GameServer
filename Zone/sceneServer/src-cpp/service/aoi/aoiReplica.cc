@@ -37,7 +37,8 @@ AoiReplica::~AoiReplica() = default;
 
 AoiReplica::ApplyResult AoiReplica::Apply(const AoiEvent& ev, 
                                           Source src,
-                                          std::unordered_set<uint64_t>& dirtyObservers)
+                                          std::unordered_set<uint64_t>& dirtyObservers,
+                                          std::unordered_set<EntityId>* dirtyEntities)
 {
     //校验消息来源类型
     if (src != Source::kLocal && src != Source::kRemote)
@@ -104,6 +105,11 @@ AoiReplica::ApplyResult AoiReplica::Apply(const AoiEvent& ev,
         processLocalAoiMsg(ev, cellIdx, dirtyObservers);
     else
         processRemoteAoiMsg(ev, cellIdx, dirtyObservers);
+
+    // 只有成功应用才记录"本帧发生变化的实体"，供增量推送使用
+    if (dirtyEntities != nullptr)
+        dirtyEntities->insert(ev.eId);
+
     return ApplyResult::kApplied;
 }
 
@@ -343,11 +349,9 @@ void AoiReplica::onLocalEntry(const AoiEvent& ev, uint32_t cellIdx, std::unorder
         //更新已有实例
         auto& ent = it->second;
         //先移除旧实例的所有关注格
-        auto oldWatch = grid_->getWatchCellIdx(ent.x, ent.y);
-        for(auto idx : oldWatch)
-            grid_->removeWatcher(ev.eId, idx);
+        grid_->forEachWatchCell(ent.x, ent.y,
+            [&](uint32_t idx, uint32_t) { grid_->removeWatcher(ev.eId, idx); });
         grid_->removeEntity(ent.entityId, ent.cellIdx);
-
         //对旧格子观测者打标记
         auto& vec = grid_->watchers(ent.cellIdx);
         for(auto eId : vec)
@@ -356,9 +360,8 @@ void AoiReplica::onLocalEntry(const AoiEvent& ev, uint32_t cellIdx, std::unorder
         updateEntity(ent, ev, cellIdx);
     }
     //将实例ID添加到实例关注格watcher
-    auto cellVec = grid_->getWatchCellIdx(ev.target_x, ev.target_y);
-    for(auto cellIdx : cellVec)
-        grid_->addWatcher(ev.eId, cellIdx);
+    grid_->forEachWatchCell(ev.target_x, ev.target_y,
+        [&](uint32_t cellIdx, uint32_t) { grid_->addWatcher(ev.eId, cellIdx); });
     //注册实例
     grid_->addEntity(ev.eId, cellIdx);
     
@@ -383,10 +386,9 @@ void AoiReplica::onLocalMove(const AoiEvent& ev, uint32_t cellIdx, std::unordere
         auto oldCellIdx = entIt->second.cellIdx;
 
         //TODO 还能优化，减少两次Vector构造，一次拷贝拷贝
-        auto oldWatch = grid_->getWatchCellIdx(entIt->second.x, entIt->second.y);
         //B.移除旧位置的所有观察格子中自身的ID
-        for(auto idx : oldWatch)
-            grid_->removeWatcher(ev.eId, idx);
+        grid_->forEachWatchCell(entIt->second.x, entIt->second.y,
+            [&](uint32_t idx, uint32_t) { grid_->removeWatcher(ev.eId, idx); });
         
         grid_->removeEntity(ev.eId, oldCellIdx);
 
@@ -408,9 +410,8 @@ void AoiReplica::onLocalMove(const AoiEvent& ev, uint32_t cellIdx, std::unordere
     }
 
     //2.为新位置感兴趣格子添加自身实例Id
-    auto newWatch = grid_->getWatchCellIdx(ev.target_x,ev.target_y);
-    for(auto idx : newWatch)
-        grid_->addWatcher(ev.eId, idx);
+    grid_->forEachWatchCell(ev.target_x, ev.target_y,
+        [&](uint32_t idx, uint32_t) { grid_->addWatcher(ev.eId, idx); });
     
     //3.更新实例ID
     auto& ent = entIt->second;
@@ -447,11 +448,9 @@ void AoiReplica::onLocalLeave(const AoiEvent& ev, uint32_t cellIdx, std::unorder
         dirtyObservers.insert(eId);
 
     //TODO 还能优化，减少两次Vector构造，一次拷贝
-    auto oldWatch = grid_->getWatchCellIdx(it->second.x, it->second.y);
-
     //移除旧位置的观察格子
-    for(auto idx : oldWatch)
-        grid_->removeWatcher(ev.eId, idx);
+    grid_->forEachWatchCell(it->second.x, it->second.y,
+        [&](uint32_t idx, uint32_t) { grid_->removeWatcher(ev.eId, idx); });
 
     //移除该实例
     grid_->removeEntity(ev.eId, it->second.cellIdx);

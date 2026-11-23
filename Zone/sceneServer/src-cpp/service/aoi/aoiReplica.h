@@ -27,7 +27,10 @@ public:
     AoiReplica(workerId selfWorkerId, const AoiConfig& config, const Map& map);
     ~AoiReplica();
 
-    ApplyResult Apply(const AoiEvent& ev, Source src, std::unordered_set<uint64_t>& dirtyObservers);
+    // dirtyEntities 可选（默认 nullptr，保持既有调用不变）：
+    // 事件成功应用后把所属实体 ID 记入，供"视野结构未变时只推送变化实体"使用。
+    ApplyResult Apply(const AoiEvent& ev, Source src, std::unordered_set<uint64_t>& dirtyObservers,
+                      std::unordered_set<EntityId>* dirtyEntities = nullptr);
 
     void addWatcher(uint64_t observerId, uint32_t cell);
     void removeWatcher(uint64_t observerId, uint32_t cell);
@@ -37,6 +40,12 @@ public:
 
     //获取格子索引对应的视野格
     const AoiCell& cell(uint32_t cellIdx) const;
+    // 本格实体成员版本：实体进入/离开本格即递增
+    uint32_t cellMembersRev(uint32_t cellIdx) const { return grid_->membersRev(cellIdx); }
+    // 以该格为中心的视野格集合
+    std::vector<uint32_t> watchCellsOfCell(uint32_t cellIdx) const { return grid_->watchCellsOfCell(cellIdx); }
+    // 两个格子是否互相可见（切比雪夫距离 <= r）：O(1)，不分配
+    bool cellVisible(uint32_t cellA, uint32_t cellB) const { return grid_->visible(cellA, cellB); }
     //根据实例Id查询对应实例信息
     const AoiEntity* findById(uint64_t id) const;
 

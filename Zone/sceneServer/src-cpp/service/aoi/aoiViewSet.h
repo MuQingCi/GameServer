@@ -40,6 +40,13 @@ struct ObserverSnapshot
 
     bool needResync = false;
     uint32_t resyncRevision = 0;
+
+    // ---- 视野结构缓存（仅所属逻辑线程访问）----
+    // 上次构建/校验该视野时观察者自身所在格，以及其视野格的实体成员版本。
+    // 两者都未变 => 可见成员集合未变 => 可跳过全量重建，只推送本帧变化的实体。
+    uint32_t structCenterCell = 0xFFFFFFFFu;
+    std::vector<uint32_t> structCells;
+    std::vector<uint32_t> structRevs;
 };
 
 
@@ -90,6 +97,8 @@ public:
     
     //查询,不存在则返回nullptr
     const ObserverSnapshot* findObserver(EntityId observerId) const;
+    // 仅限所属逻辑线程的结构缓存维护用途；不得跨线程或长期持有
+    ObserverSnapshot* findObserverMutable(EntityId observerId);
     const SentEntityState* findSentState(EntityId observerId, EntityId targetId) const;
 
     // 一次调用对应一个已成功入队的帧，items 按帧内顺序处理。
