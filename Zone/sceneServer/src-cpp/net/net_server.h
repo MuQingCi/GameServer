@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <queue>
 #include <string>
 #include <thread>
@@ -74,7 +75,8 @@ struct PeerConfig
 class NetServer
 {
 public:
-    NetServer(const NetConfig& cfg, MsgBus& bus);
+    // netIndex 标识本网络分片（0..netThreads-1）：决定 session 高位、net 队列下标与唤醒句柄
+    NetServer(const NetConfig& cfg, MsgBus& bus, uint32_t netIndex = 0);
     ~NetServer();
 
     NetServer(const NetServer&) = delete;
@@ -83,7 +85,8 @@ public:
     bool start();
     void stop();
 
-    // 反向连接：非阻塞 connect，完成后再向对应逻辑线程投 MSGTYPE_CONN_NEW
+    // 反向连接：只登记"要连哪个 peer"，真正的 dial 在**网络线程**里做。
+    // 这样既不跨线程碰 conns_，也让断线后能按退避自动重连。
     bool connectTo(const PeerConfig& peer);
 
 private:
@@ -128,6 +131,21 @@ private:
     bool registerConn(Conn&& conn, uint32_t events);
     MsgBus::WorkerId workerForSession(uint64_t session, bool assignIfMissing, uint64_t playerId);
 
+    // ---- 反向连接与自动重连（仅网络线程）----
+    struct PeerState
+    {
+        PeerConfig peer;
+        int64_t    nextAttemptMs = 0;   // 下次允许尝试的时间（NowMs 口径）
+        uint32_t   attempts = 0;        // 连续失败次数，用于退避
+        bool       connected = false;   // 已有可用连接（握手完成前仍视为未连通）
+        bool       dialing = false;     // 已发起、尚未完成，避免重复 dial
+    };
+    bool dialPeer(const PeerConfig& peer);              // 真正建连（仅网络线程）
+    void maintainPeers();                               // 消费登记意图 + 退避重连
+    void onPeerGone(uint32_t gatewayId, uint32_t channelId, bool wasConnected);
+    static int64_t peerBackoffMs(uint32_t attempts);
+    int  peerWaitMs(int currentTimeoutMs) const;        // 把 epoll 超时收敛到最近的重连时刻
+
     void sendRetTip(const Msg& request, int32_t code, const char* text);
 
     MsgBus* m_bus_ = nullptr;
@@ -141,10 +159,15 @@ private:
     int wakeupFd_ = -1;
 
     std::atomic<uint64_t> nextSession_{1};
+    uint32_t netIndex_ = 0;
 
     // 以下成员只允许网络线程访问
     std::unordered_map<uint64_t, Conn> conns_;
     GatewayClientIndex clients_;
+    // 反向连接状态：peers_ 只允许网络线程访问；pendingPeers_ 是主线程的登记队列
+    std::vector<PeerState> peers_;
+    std::mutex peerMutex_;
+    std::vector<PeerConfig> pendingPeers_;
 
     WorkerPendingTasks pendingTasks_;
     void submitPlayerTask(const Msg& message, bool lifecycle);

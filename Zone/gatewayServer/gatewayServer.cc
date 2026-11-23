@@ -35,9 +35,12 @@ GatewayServer::GatewayServer(EventLoop* loop,
                              const InetAddress& backendListenAddr,
                              const DispatcherConfig& dispatcherCfg,
                              size_t eventThreadNum,
-                             bool reusePort)
+                             bool reusePort,
+                             size_t backendThreadNum)
     : baseloop_(loop),
       eventThreadPool_(cb, "ClearMoon", eventThreadNum),
+      backendThreadPool_(cb, "ClearMoonBE", backendThreadNum),
+      backendThreadNum_(backendThreadNum),
       cAcceptor_(loop, clientListenAddr, connRole::Client, reusePort),
       bAcceptor_(loop, backendListenAddr, connRole::Backend, reusePort),
       threadName_("ClearMoon"),
@@ -67,6 +70,8 @@ void GatewayServer::start()
 
     // 依次启动 io 线程池与两个监听器
     eventThreadPool_.start();
+    if (backendThreadNum_ > 0)
+        backendThreadPool_.start();
     cAcceptor_.listen();
     bAcceptor_.listen();
 
@@ -147,7 +152,10 @@ void GatewayServer::newConnection(Socket socket, InetAddress peerAddress, connRo
         return;   // socket 在此析构关闭
     }
 
-    EventLoop* ioLoop = eventThreadPool_.getNextLoop();
+    // 后端连接走独立线程池：避免场景上行推送把客户端请求堵在同一个 epoll 线程里
+    EventLoop* ioLoop = (role == connRole::Backend && backendThreadNum_ > 0)
+                            ? backendThreadPool_.getNextLoop()
+                            : eventThreadPool_.getNextLoop();
     // 连接名唯一：nextConnId_ 只在这里自增一次（历史缺陷：同一连接里被自增两次，
     // 既造成编号跳号，又让"会话->连接"索引与"连接名"索引对不上）
     const std::string name = threadName_ + "-" + RoleTag(role) + "#" + std::to_string(nextConnId_++);

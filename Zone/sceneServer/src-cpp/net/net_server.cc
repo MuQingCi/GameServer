@@ -1,5 +1,7 @@
 #include "net/net_server.h"
 
+#include "common/netRoute.h"
+
 #include "common/hash.h"
 #include "base/proto.h"
 #include "base/utils.h"
@@ -42,8 +44,8 @@ uint8_t LinkTypeOf(uint8_t serviceId)
 }
 }  // namespace
 
-NetServer::NetServer(const NetConfig& cfg, MsgBus& bus)
-    : m_bus_(&bus), cfg_(cfg), pendingTasks_(bus.numWorker(),cfg.pending)
+NetServer::NetServer(const NetConfig& cfg, MsgBus& bus, uint32_t netIndex)
+    : m_bus_(&bus), cfg_(cfg), netIndex_(netIndex), pendingTasks_(bus.numWorker(),cfg.pending)
 {
 }
 
@@ -89,38 +91,58 @@ bool NetServer::start()
 
         int one = 1;
         ::setsockopt(listenFd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        // 多网络分片时每个分片各建一个监听 socket，由内核在 SO_REUSEPORT 组内分摊
+#ifdef SO_REUSEPORT
+        if (!::setsockopt(listenFd_, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)))
+        {
+            // 不支持时退化为"仅 0 号分片监听"，避免启动失败
+            if (netIndex_ != 0)
+            {
+                LOG_WARNING << "SO_REUSEPORT unavailable, net shard " << netIndex_
+                            << " skips listening";
+                ::close(listenFd_);
+                listenFd_ = -1;
+            }
+        }
+#endif
 
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = host16ToNet(cfg_.listenPort);
-        if (::inet_pton(AF_INET, cfg_.listenAddr.c_str(), &addr.sin_addr) != 1)
+        if (listenFd_ >= 0)
         {
-            LOG_ERROR << "bad listen addr: " << cfg_.listenAddr;
-            return false;
-        }
+            if (::inet_pton(AF_INET, cfg_.listenAddr.c_str(), &addr.sin_addr) != 1)
+            {
+                LOG_ERROR << "bad listen addr: " << cfg_.listenAddr;
+                return false;
+            }
 
-        if (::bind(listenFd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+            if (::bind(listenFd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+            {
+                LOG_ERROR << "bind " << cfg_.listenAddr << ":" << cfg_.listenPort
+                        << " failed: " << std::strerror(errno);
+                return false;
+            }
+            if (::listen(listenFd_, 1024) != 0)
+            {
+                LOG_ERROR << "listen failed: " << std::strerror(errno);
+                return false;
+            }
+        }
+        if (listenFd_ >= 0)
         {
-            LOG_ERROR << "bind " << cfg_.listenAddr << ":" << cfg_.listenPort
-                      << " failed: " << std::strerror(errno);
-            return false;
-        }
-        if (::listen(listenFd_, 1024) != 0)
-        {
-            LOG_ERROR << "listen failed: " << std::strerror(errno);
-            return false;
-        }
+            epoll_event lev{};
+            lev.events = EPOLLIN;
+            lev.data.u64 = kListenTag;
+            ::epoll_ctl(epFd_, EPOLL_CTL_ADD, listenFd_, &lev);
 
-        epoll_event lev{};
-        lev.events = EPOLLIN;
-        lev.data.u64 = kListenTag;
-        ::epoll_ctl(epFd_, EPOLL_CTL_ADD, listenFd_, &lev);
-
-        LOG_INFO << "net listen on " << cfg_.listenAddr << ":" << cfg_.listenPort;
+            LOG_INFO << "net listen on " << cfg_.listenAddr << ":" << cfg_.listenPort
+                     << " shard=" << netIndex_;
+        }
     }
 
     // 注册唤醒：任意逻辑线程 sendToNet 后由本线程的 eventfd 唤醒 epoll
-    m_bus_->setNetWakeup([this] { wakeup(); });
+    m_bus_->setNetWakeup(netIndex_, [this] { wakeup(); });
 
     started_.store(true, std::memory_order_release);
     thread_ = std::thread([this] { run(); });
@@ -180,7 +202,28 @@ bool NetServer::connectTo(const PeerConfig& peer)
         LOG_ERROR << "connectTo before start()";
         return false;
     }
+    // 只登记意图：真正的 socket/connect 由网络线程执行，避免跨线程访问 conns_
+    {
+        std::lock_guard<std::mutex> lock(peerMutex_);
+        pendingPeers_.push_back(peer);
+    }
+    wakeup();
+    return true;
+}
 
+int64_t NetServer::peerBackoffMs(uint32_t attempts)
+{
+    // 200ms 起指数退避，上限 5s；避免网关未就绪时形成重连风暴
+    constexpr int64_t kBase = 200;
+    constexpr int64_t kMax  = 5000;
+    int64_t delay = kBase;
+    for (uint32_t i = 0; i < attempts && delay < kMax; ++i)
+        delay *= 2;
+    return std::min(delay, kMax);
+}
+
+bool NetServer::dialPeer(const PeerConfig& peer)
+{
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0)
     {
@@ -204,7 +247,7 @@ bool NetServer::connectTo(const PeerConfig& peer)
 
     Conn conn;
     conn.fd = fd;
-    conn.session = nextSession_.fetch_add(1, std::memory_order_relaxed);
+    conn.session = netroute::MakeSession(netIndex_, nextSession_.fetch_add(1, std::memory_order_relaxed));
     conn.peerServiceID = peer.serviceId;
     conn.gatewayId = peer.gatewayId;
     conn.channelId = peer.channelId;
@@ -232,14 +275,121 @@ bool NetServer::connectTo(const PeerConfig& peer)
     return true;
 }
 
+void NetServer::maintainPeers()
+{
+    // 1) 消费主线程登记的连接意图（同 gatewayId+channelId 视为同一 peer）
+    {
+        std::vector<PeerConfig> incoming;
+        {
+            std::lock_guard<std::mutex> lock(peerMutex_);
+            incoming.swap(pendingPeers_);
+        }
+        for (const auto& p : incoming)
+        {
+            auto it = std::find_if(peers_.begin(), peers_.end(), [&](const PeerState& s) {
+                return s.peer.gatewayId == p.gatewayId && s.peer.channelId == p.channelId;
+            });
+            if (it == peers_.end())
+            {
+                PeerState st;
+                st.peer = p;
+                st.nextAttemptMs = 0;   // 立即尝试
+                peers_.push_back(std::move(st));
+            }
+            else
+            {
+                it->peer = p;           // 地址可能变化
+                it->nextAttemptMs = 0;
+            }
+        }
+    }
+
+    // 2) 未连通的 peer：按退避重连
+    const int64_t now = NowMs();
+    for (auto& st : peers_)
+    {
+        if (st.connected || st.dialing || now < st.nextAttemptMs)
+            continue;
+
+        if (dialPeer(st.peer))
+        {
+            st.dialing = true;
+            // 等 EPOLLOUT 确认；若异步失败，handleClose -> onPeerGone 会重排
+            st.nextAttemptMs = now + 1000;
+        }
+        else
+        {
+            ++st.attempts;
+            const int64_t backoff = peerBackoffMs(st.attempts);
+            st.nextAttemptMs = now + backoff;
+            LOG_WARNING << "reconnect to gateway " << st.peer.addr << ":" << st.peer.port
+                        << " channel=" << st.peer.channelId << " failed, attempts=" << st.attempts
+                        << ", retry in " << backoff << "ms";
+        }
+    }
+}
+
+void NetServer::onPeerGone(uint32_t gatewayId, uint32_t channelId, bool wasConnected)
+{
+    const int64_t now = NowMs();
+    for (auto& st : peers_)
+    {
+        if (st.peer.gatewayId != gatewayId || st.peer.channelId != channelId)
+            continue;
+
+        st.connected = false;
+        st.dialing = false;
+        if (wasConnected)
+        {
+            // 已建立的链路断开：快速重试，并重置退避
+            st.attempts = 0;
+            st.nextAttemptMs = now + 200;
+            LOG_WARNING << "backend link lost, gateway=" << gatewayId
+                        << " channel=" << channelId << ", reconnect in 200ms";
+        }
+        else
+        {
+            ++st.attempts;
+            const int64_t backoff = peerBackoffMs(st.attempts);
+            st.nextAttemptMs = now + backoff;
+            LOG_WARNING << "backend connect failed, gateway=" << gatewayId
+                        << " channel=" << channelId << " attempts=" << st.attempts
+                        << ", retry in " << backoff << "ms";
+        }
+        return;
+    }
+}
+
+int NetServer::peerWaitMs(int currentTimeoutMs) const
+{
+    if (peers_.empty())
+        return currentTimeoutMs;
+    const int64_t now = NowMs();
+    int64_t wait = currentTimeoutMs;
+    for (const auto& st : peers_)
+    {
+        if (st.connected || st.dialing)
+            continue;
+        const int64_t delta = std::max<int64_t>(0, st.nextAttemptMs - now);
+        wait = std::min(wait, std::min<int64_t>(delta, 1000));
+    }
+    return static_cast<int>(std::max<int64_t>(0, wait));
+}
+
 void NetServer::run()
 {
     epoll_event events[256];
 
     while (started_.load(std::memory_order_acquire))
     {
+        // 反向连接维护：消费主线程登记 + 按退避重连（必须在本线程做）
+        maintainPeers();
+
         //// -1：纯阻塞等待。已有 eventfd 唤醒机制，不需要超时轮询
-        const int n = ::epoll_wait(epFd_, events, 256, pendingTasks_.waitMs(QueueDiagnostics::nowUs()));
+        // 但有未连通的 peer 时，把超时收敛到最近一次重连时刻
+        int timeoutMs = pendingTasks_.waitMs(QueueDiagnostics::nowUs());
+        timeoutMs = peerWaitMs(timeoutMs);
+        const int n = ::epoll_wait(epFd_, events, 256, timeoutMs);
         if (n < 0)
         {
             if (errno == EINTR)
@@ -338,7 +488,7 @@ void NetServer::acceptNewConn()
 
         Conn conn;
         conn.fd = fd;
-        conn.session = nextSession_.fetch_add(1, std::memory_order_relaxed);
+        conn.session = netroute::MakeSession(netIndex_, nextSession_.fetch_add(1, std::memory_order_relaxed));
         // 入站连接的归属由握手确认；默认按网关处理（与部署形态一致）
         conn.peerServiceID = ServerID::kGateway;
         conn.linkType = LinkTypeOf(conn.peerServiceID);
@@ -485,6 +635,18 @@ void NetServer::onPeerWritable(Conn& conn)
 
     conn.connecting = false;
 
+    // 链路可用：更新重连状态，避免重复 dial
+    for (auto& st : peers_)
+    {
+        if (st.peer.gatewayId == conn.gatewayId && st.peer.channelId == conn.channelId)
+        {
+            st.connected = true;
+            st.dialing = false;
+            st.attempts = 0;
+            break;
+        }
+    }
+
     // 握手：上报本服务身份（serviceType/zoneId/sceneId），网关据此登记 backend 连接
     BackendHandshake hs;
     hs.serviceId = cfg_.serviceId;
@@ -606,7 +768,7 @@ void NetServer::processBusMsg()
 {
     retryClientNotifications();
     Msg m;
-    while (m_bus_->tryPopNet(m))
+    while (m_bus_->tryPopNet(netIndex_, m))
     {
         auto it = conns_.find(m.head.session);
         if (it == conns_.end())
@@ -630,10 +792,12 @@ void NetServer::sendTo(Conn& conn, const Msg& m)
     // 1. 先把这一条消息编码成单独的完整帧
     //    绝不能在 conn.sendBuffer 上直接编码：它里面可能还堆着上一轮 EAGAIN 的残余，那样会把"旧残余 + 新消息"当成一条消息算长度，帧边界永久错乱
     Buffer frame;
+    // 共享载荷优先：同一批次发给多个 worker/网关时不再逐份拷贝 body
+    const std::string& body = m.sharedBody ? *m.sharedBody : m.body;
     EncodeFrame(frame,
                 MakeHeader(conn.linkType, m.head.Module, m.head.Method, m.head.seq,
                            m.head.playerId, cfg_.serviceId, conn.peerServiceID),
-                m.body);
+                body);
 
     // 2. 写缓冲上限：慢客户端不能被允许拖垮整个进程内存
     if (conn.sendBuffer.readableBytes() + frame.readableBytes() > cfg_.maxWriteBufferBytes)
@@ -705,6 +869,11 @@ void NetServer::handleClose(Conn& conn)
     const uint64_t session = conn.session;
     const int fd = conn.fd;
     const uint8_t peer = conn.peerServiceID;
+    // 反向连接断开要登记重连；字段必须在 conns_.erase 之前取出（引用会失效）
+    const bool outbound = conn.outbound;
+    const uint32_t gatewayId = conn.gatewayId;
+    const uint32_t channelId = conn.channelId;
+    const bool wasConnected = !conn.connecting;
 
     auto it = conns_.find(session);
     if (it == conns_.end())
@@ -717,6 +886,9 @@ void NetServer::handleClose(Conn& conn)
     }
     conns_.erase(it);
     pendingTasks_.cancelSession(session);
+
+    if (outbound)
+        onPeerGone(gatewayId, channelId, wasConnected);
 
     //清理会话表
     MsgBus::WorkerId wid = hashutil::WorkerForSession(session, m_bus_->numWorker());

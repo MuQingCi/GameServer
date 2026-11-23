@@ -51,7 +51,8 @@ public:
                   const InetAddress& backendListenAddr,
                   const DispatcherConfig& dispatcherCfg,
                   size_t eventThreadNum = 0,
-                  bool reusePort = false);
+                  bool reusePort = false,
+                  size_t backendThreadNum = 0);
     ~GatewayServer();
 
     // 设置回调（仅用于观测/日志；会话与路由逻辑在 GatewayDispatcher 内）
@@ -75,6 +76,10 @@ private:
 
     EventLoop* baseloop_;
     EventLoopThreadPool eventThreadPool_;
+    // 后端连接专用线程池：把"场景上行推送"与"客户端请求"分到不同 IO 线程，
+    // 消除同一线程内两类帧的相互 HOL（head-of-line）阻塞。backendThreadNum_ == 0 时复用 eventThreadPool_。
+    EventLoopThreadPool backendThreadPool_;
+    size_t backendThreadNum_ = 0;
 
     Acceptor cAcceptor_;
     Acceptor bAcceptor_;

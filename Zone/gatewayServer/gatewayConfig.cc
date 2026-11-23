@@ -134,6 +134,10 @@ bool GatewayConfig::Load(const std::string& path, GatewayConfig& out, std::strin
     out.maxPendingRoutes = (uint32_t)y.GetUInt("gateway.maxPendingRoutes", out.maxPendingRoutes);
     out.routeTtlMs = (uint32_t)y.GetUInt("gateway.routeTtlMs", out.routeTtlMs);
     out.maxFramesPerSec = (uint32_t)y.GetUInt("gateway.maxFramesPerSec", out.maxFramesPerSec);
+    out.backendMaxReadBufferBytes =
+        (size_t)y.GetUInt("gateway.backendMaxReadBufferBytes", out.backendMaxReadBufferBytes);
+    out.backendThreadNum =
+        (size_t)y.GetUInt("gateway.backendThreadNum", out.backendThreadNum);
 
     out.logLevel = y.GetStr("gateway.logLevel", out.logLevel);
     out.logDir = y.GetStr("gateway.logDir", out.logDir);

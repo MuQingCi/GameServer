@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -73,6 +74,7 @@ struct Connection
     Time expires = Time::max(), nextSend = Time::max(), writeProgress = Time::max();
     Time drainDeadline = Time::max(), aoiDeadline = Time::max();
     uint64_t requestId = 3, logoutId = 0, successfulMoves = 0;
+    int connectTries = 0;
     int32_t x = 0, y = 0, origin = 0;
     int direction = 1;
     bool measured = false, cutoff = false, buffered = false, eof = false;
@@ -211,6 +213,37 @@ private:
     void fail(Connection& c, Result why)
     {
         if (c.stage == Stage::Closed) return;
+        // 准备期内的传输层失败（对端关闭/写错误/超时）允许重连重试：
+        // 万级连接时个别连接被网关关闭或抖动，不应让整轮准备失败。
+        const bool preparing = shared_.epoch.load() <= 0;
+        if (preparing && (why == Result::TransportError || why == Result::Timeout) &&
+            static_cast<uint32_t>(c.connectTries) < o_.connectRetries)
+        {
+            ++c.connectTries;
+            if (c.stage == Stage::Ready)
+                shared_.ready.fetch_sub(1);   // 已计入就绪数，需要回退
+            else
+                --preparing_;                 // connect() 会重新计入
+            if (c.fd >= 0) { ::close(c.fd); c.fd = -1; }
+            c.stage = Stage::New;
+            c.input.retrieveAll();
+            c.output.clear();
+            c.outputBytes = 0;
+            c.pending.clear();
+            c.eof = false;
+            c.buffered = false;
+            c.expires = Time::max();
+            std::fprintf(stderr, "[prepare-retry] idx=%u try=%d reason=%d\n",
+                         c.index, c.connectTries, static_cast<int>(why));
+            connect(c);
+            reschedule(c);
+            return;
+        }
+        // 诊断：准备阶段失败会中止整轮，必须能看出失败阶段与 errno
+        if (shared_.epoch.load() <= 0)
+            std::fprintf(stderr, "[prepare-fail] idx=%u stage=%d reason=%d errno=%d(%s)\\n",
+                         c.index, static_cast<int>(c.stage), static_cast<int>(why),
+                         errno, std::strerror(errno));
         // 准备失败使全局屏障失败；不伪造一次业务请求的 completed。
         if (shared_.epoch.load() <= 0 || c.stage == Stage::Connecting || c.stage == Stage::Auth || c.stage == Stage::Enter)
             shared_.failed = true;
@@ -257,7 +290,7 @@ private:
     void authenticatedSocket(Connection& c)
     {
         c.stage = Stage::Auth;
-        c.expires = Clock::now() + 3s;
+        c.expires = Clock::now() + std::chrono::seconds(o_.authTimeoutSec);
         enqueue(c, Encode(ClientKind::kControl, 1, ClientSysMethod::kAuth, 1,
                            MakeAuthBody(o_.playerBase + c.index, o_.ticket)));
     }
@@ -268,6 +301,18 @@ private:
         c.expires = Clock::now() + 3s;
         c.fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (c.fd < 0) { fail(c, Result::TransportError); return; }
+        // 单机压测受本地端口范围限制（本机 4096），分散源 IP 以扩大可用五元组
+        if (o_.sourceIpSpread)
+        {
+            sockaddr_in local{};
+            local.sin_family = AF_INET;
+            local.sin_port = 0;
+            const std::string ip = "127.0.0." +
+                std::to_string(o_.sourceIpBase + static_cast<uint32_t>(c.index) % o_.sourceIpSpread);
+            if (::inet_pton(AF_INET, ip.c_str(), &local.sin_addr) != 1 ||
+                ::bind(c.fd, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0)
+            { fail(c, Result::TransportError); return; }
+        }
         int one = 1;
         ::setsockopt(c.fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         sockaddr_in address{};
@@ -344,7 +389,7 @@ private:
                 !ParseAuthAckBody(body, player, session, epoch, zone, service) || player != o_.playerBase + c.index)
             { fail(c, Result::TransportError); return; }
             if (!o_.scene) { prepared(c); return; }
-            c.stage = Stage::Enter; c.expires = Clock::now() + 5s;
+            c.stage = Stage::Enter; c.expires = Clock::now() + std::chrono::seconds(o_.enterTimeoutSec);
             enqueue(c, Encode(ClientKind::kRequest, 3, 4, 2, gs::EnterSceneReq{}.SerializeAsString()));
             return;
         }
@@ -352,7 +397,19 @@ private:
         {
             if (!MatchesLoadRequestResponse(h, 2, 3, 4) ||
                 ClassifyLoadResponse(h, body, 3, 4) != LoadResponseKind::Success ||
-                !AdvanceEnterScenePosition(body, c.x, c.y)) { fail(c, Result::TransportError); return; }
+                !AdvanceEnterScenePosition(body, c.x, c.y))
+            {
+                // 诊断：Enter 失败时打印网关/场景返回的业务码与文本
+                gs::RetTip tip;
+                if (tip.ParseFromString(body))
+                    std::fprintf(stderr, "[enter-fail] idx=%u retTip code=%d text=%s\n",
+                                 c.index, tip.code(), tip.text().c_str());
+                else
+                    std::fprintf(stderr, "[enter-fail] idx=%u bytes=%zu module=%u method=%u raw=%.*s\n",
+                                 c.index, body.size(), h.module, h.method,
+                                 static_cast<int>(body.size()), body.data());
+                fail(c, Result::TransportError); return;
+            }
             prepared(c); return;
         }
         if (c.stage == Stage::Logout)
@@ -520,7 +577,19 @@ private:
         if (c.stage == Stage::Closed) return;
         if (!c.output.empty() && now >= c.writeProgress + 2s) { fail(c, Result::TransportError); return; }
         if ((c.stage == Stage::Connecting || c.stage == Stage::Auth || c.stage == Stage::Enter || c.stage == Stage::Logout) && now >= c.expires)
-        { fail(c, Result::Timeout); return; }
+        {
+            // 仅对 TCP 建立超时重试：万级连接时 acceptor 可能丢弃部分 SYN
+            if (c.stage == Stage::Connecting && static_cast<uint32_t>(c.connectTries) < o_.connectRetries)
+            {
+                ++c.connectTries;
+                if (c.fd >= 0) { ::close(c.fd); c.fd = -1; }
+                --preparing_;          // connect() 内部会重新计入
+                connect(c);
+                reschedule(c);
+                return;
+            }
+            fail(c, Result::Timeout); return;
+        }
         if (c.stage == Stage::Ready && shared_.epoch.load() > 0)
         {
             if (shared_.stop) { close(c, true); return; }

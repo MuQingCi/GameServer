@@ -50,6 +50,10 @@ public:
     uint32_t    maxPendingRoutes = 10000;       // 在途请求上限（有界，防内存无界增长）
     uint32_t    routeTtlMs = 15000;             // 回程路由 TTL：后端不响应时回收
     uint32_t    maxFramesPerSec = 500;          // 单连接入站帧速率上限
+    // 后端聚合连接专用读缓冲上限（场景上行 = 响应 + AOI 推送，与客户端侧不同量级）
+    size_t      backendMaxReadBufferBytes = 8 * 1024 * 1024;
+    // 后端连接专用 IO 线程数：0 = 与客户端共用 eventThreadNum 个线程（旧行为）
+    size_t      backendThreadNum = 0;
 
     // 日志级别：debug / info / warn / error
     // （网关原先写死 INFO，排障时只能改代码重编；这里先做成配置项，

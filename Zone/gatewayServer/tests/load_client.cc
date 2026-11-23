@@ -92,6 +92,11 @@ bool ParseArgs(int argc, char** argv, Options& options)
         if (arg == "--metrics-output") { const char* v = next("--metrics-output"); if (!v) return false; options.metricsOutput = v; continue; }
         if (arg == "--barrier-dir") { const char* v = next("--barrier-dir"); if (!v) return false; options.barrierDir = v; continue; }
         if (arg == "--scene") { options.scene = true; options.ping = false; continue; }
+        if (arg == "--auth-timeout") { const char* v=next("--auth-timeout"); if(!v || !ParseUInt(v,value) || value<1 || value>600) return false; options.authTimeoutSec=static_cast<uint32_t>(value); continue; }
+        if (arg == "--enter-timeout") { const char* v=next("--enter-timeout"); if(!v || !ParseUInt(v,value) || value<1 || value>600) return false; options.enterTimeoutSec=static_cast<uint32_t>(value); continue; }
+        if (arg == "--connect-retries") { const char* v = next("--connect-retries"); if (!v || !ParseUInt(v, value) || value > 20) return false; options.connectRetries = static_cast<uint32_t>(value); continue; }
+        if (arg == "--source-ip-spread") { const char* v = next("--source-ip-spread"); if (!v || !ParseUInt(v, value) || value > 200) return false; options.sourceIpSpread = static_cast<uint32_t>(value); continue; }
+        if (arg == "--source-ip-base") { const char* v = next("--source-ip-base"); if (!v || !ParseUInt(v, value) || value < 2 || value > 250) return false; options.sourceIpBase = static_cast<uint32_t>(value); continue; }
         if (arg == "--stagger") { options.stagger = true; continue; }
         if (arg == "--warmup") { const char* v=next("--warmup"); if(!v || !ParseUInt(v,value) || value>300)return false;options.warmupSec=value;continue; }
         if (arg == "--idle-before" || arg == "--hold-after") {

@@ -262,10 +262,14 @@ bool GatewayDispatcher::CheckProtocolMagic(const TcpConnectionPtr& conn, Buffer*
 
 bool GatewayDispatcher::CheckReadBuffer(const TcpConnectionPtr& conn)
 {
-    // 读缓冲上限：对端持续发但拆不出整帧（或逻辑侧消费不过来）时必须断开而不是无限增长
-    if (conn->readBufferBytes() > cfg_.maxReadBufferBytes)
+    // 读缓冲上限：对端持续发但拆不出整帧（或逻辑侧消费不过来）时必须断开而不是无限增长。
+    // 后端连接承载整个场景的上行（响应 + AOI 推送），必须用独立上限。
+    const size_t limit = conn->role() == Backend ? cfg_.backendMaxReadBufferBytes
+                                                 : cfg_.maxReadBufferBytes;
+    if (conn->readBufferBytes() > limit)
     {
-        LOG_WARNING << "read buffer overflow (" << conn->readBufferBytes() << "), close " << conn->name();
+        LOG_WARNING << "read buffer overflow (" << conn->readBufferBytes() << " > " << limit
+                    << "), close " << conn->name();
         conn->forceClose("read buffer overflow");
         return false;
     }

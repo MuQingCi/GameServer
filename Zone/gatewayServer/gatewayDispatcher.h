@@ -34,6 +34,9 @@ struct DispatcherConfig
     uint32_t routeTtlMs         = 15000;
     uint32_t maxDecodeErrors    = 32;
     size_t   maxReadBufferBytes = 1024 * 1024;
+    // 后端聚合连接专用读缓冲：一条连接承载整个场景的上行（响应 + AOI 推送），
+    // 用客户端侧 1MB 上限会在万级并发下被推送突发打爆（read buffer overflow -> forceClose）。
+    size_t   backendMaxReadBufferBytes = 8 * 1024 * 1024;
     uint32_t maxFramesPerSec    = 500;
 };
 

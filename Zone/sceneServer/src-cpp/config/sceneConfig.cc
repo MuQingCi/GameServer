@@ -87,6 +87,8 @@ LogicThread::Config SceneConfig::MakeLogicConfig() const
     c.redisNs = RedisNs();
     c.persistenceEnabled = zone.dbEnable;
     c.activeIndex = activeIndex;
+    c.spawnScatter = spawnScatter;
+    c.spawnSpacing = spawnSpacing;
     return c;
 }
 
@@ -179,6 +181,12 @@ bool SceneConfig::Load(const std::string& path, SceneConfig& out, std::string& e
     out.sceneId = (uint32_t)y.GetUInt("SceneServer.sceneId", out.sceneId);
     out.serviceId = (uint8_t)y.GetUInt("SceneServer.serviceId", out.serviceId);
     out.logicThreadNum = (uint32_t)y.GetUInt("SceneServer.logicThreadNum", out.logicThreadNum);
+    out.netThreads = (uint32_t)y.GetUInt("SceneServer.netThreads", out.netThreads);
+    if (out.netThreads == 0 || out.netThreads > 64)
+    {
+        err = path + ": netThreads must be in [1, 64]";
+        return false;
+    }
     out.luaDir = y.GetStr("SceneServer.luaDir", out.luaDir);
     out.metricsPath = y.GetStr("SceneServer.metricsPath", out.metricsPath);
     auto mapPath = std::filesystem::path(y.GetStr("SceneServer.mapPath", "map.yaml"));
@@ -208,7 +216,17 @@ bool SceneConfig::Load(const std::string& path, SceneConfig& out, std::string& e
         (uint32_t)y.GetUInt("SceneServer.net.maxFramesPerSec", out.net.maxFramesPerSec);
     out.net.maxDecodeErrors =
         (uint32_t)y.GetUInt("SceneServer.net.maxDecodeErrors", out.net.maxDecodeErrors);
-
+    // 队列深度上限：0 表示无界，保持既有行为；显式配置后才启用背压
+    out.queueWorkerMaxDepth =
+        (uint32_t)y.GetUInt("SceneServer.queue.workerMaxDepth", out.queueWorkerMaxDepth);
+    out.queueNetMaxDepth =
+        (uint32_t)y.GetUInt("SceneServer.queue.netMaxDepth", out.queueNetMaxDepth);
+    out.queueDbMaxDepth =
+        (uint32_t)y.GetUInt("SceneServer.queue.dbMaxDepth", out.queueDbMaxDepth);
+    // 分散出生点（默认关闭，保持既有行为）
+    out.spawnScatter = y.GetBool("SceneServer.spawn.scatter", out.spawnScatter);
+    out.spawnSpacing =
+        (uint32_t)y.GetUInt("SceneServer.spawn.spacing", out.spawnSpacing);
     auto pendingUInt=[&](const char* key,auto& target) {
         const std::string full=std::string("SceneServer.net.")+key;
         if(!y.Has(full)) return true;

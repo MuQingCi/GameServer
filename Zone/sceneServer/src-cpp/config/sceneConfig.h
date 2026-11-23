@@ -30,6 +30,7 @@ struct SceneConfig
     uint32_t sceneId = 1;                   // 场景编号（握手时上报网关）
     uint8_t  serviceId = 8;                 // ServerID::kScene
     uint32_t logicThreadNum = 4;            // 建议 2~4：每个 Lua VM 都加载全套脚本，内存 × N
+    uint32_t netThreads = 1;                // 网络分片数（epoll 线程）：1 = 单线程（旧行为）
     std::string luaDir = "./lua_script";
     // 默认相对配置文件目录，不依赖进程工作目录。
     std::string mapPath;
@@ -42,6 +43,18 @@ struct SceneConfig
     int64_t scanIdleMs = 10000;        // 空闲玩家扫描间隔
 
     bool    activeIndex = false;
+
+    // 内部队列深度上限：0 = 无界（保持既有行为）。
+    // >0 时超限投递返回 kBackpressure，由网络层转 busy / AOI 保留待推送重试。
+    // 推荐值按内存预算推导，见 docs/AOI热点审核与技术深度提升方案.md。
+    uint32_t queueWorkerMaxDepth = 0;
+    uint32_t queueNetMaxDepth    = 0;
+    uint32_t queueDbMaxDepth     = 0;
+
+    // 分散出生点（默认关闭）：仅用于压测/新服开荒，避免"全员同格"使 AOI 密度 V=N。
+    // 开启后，位置恰为地图原点 (0,0) 的玩家（即无存档的新角色）会按 playerId 确定性分散。
+    bool     spawnScatter = false;
+    uint32_t spawnSpacing = 100;   // 分散网格间距（地图坐标单位），需大于 AOI viewRange
     // ---------------- 定时器 ----------------
     uint64_t timerTickMs = 50;
     uint32_t timerWheelSlots = 256;

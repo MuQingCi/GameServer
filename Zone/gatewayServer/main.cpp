@@ -130,6 +130,7 @@ int main(int argc, char** argv)
     dcfg.maxPendingRoutes   = cfg.maxPendingRoutes;
     dcfg.routeTtlMs         = cfg.routeTtlMs;
     dcfg.maxFramesPerSec    = cfg.maxFramesPerSec;
+    dcfg.backendMaxReadBufferBytes = cfg.backendMaxReadBufferBytes;
 
     GatewayServer server(&baseLoop,
                          [](EventLoop*) { Current::setThreadName("gateway-io"); },
@@ -137,7 +138,8 @@ int main(int argc, char** argv)
                          privateAddr,
                          dcfg,
                          cfg.eventThreadNum,
-                         cfg.reusePort);
+                         cfg.reusePort,
+                         cfg.backendThreadNum);
 
     // 连接生命周期只在这里打日志（协议/鉴权/路由都在 GatewayDispatcher 内完成）。
     // c/b 前缀 + 角色名让"这条连接属于哪类数据"在日志里一眼可分。
