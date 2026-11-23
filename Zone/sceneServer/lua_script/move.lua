@@ -17,6 +17,12 @@ move = move or {}
 -- 自动行走的定时器句柄：pid -> timerId
 local autoWalkTimers = {}
 
+-- 自动行走定时器开关：
+--   关闭时完全不创建周期定时器（默认）。开启后每个移动过的玩家会有一个 500ms 循环定时器，
+--   在 1 万在线时会额外产生 2 万次/秒的定时器触发，直接压满 TimerThread 与逻辑线程队列，
+--   属于演示用途，压测/线上应保持关闭。
+local enableAutoWalkTimer = false
+
 function move.c2s_walk(session, pid, req)
     local p = player.info(pid)
     if p == nil then
@@ -49,17 +55,22 @@ function move.c2s_walk(session, pid, req)
 
     net.send(session, "WalkAck", { code = 0, x = dx, y = dy, dir = 0 })
 
-    -- 每 500ms 推一次状态，示范 Lua 定时器 + 玩家下线自动清理
-    local old = autoWalkTimers[pid]
-    if old then
-        timer.cancel(old)
+    -- 每 500ms 推一次状态，示范 Lua 定时器 + 玩家下线自动清理。
+    -- 关键：每个玩家只创建一个循环定时器，且默认不创建（见 enableAutoWalkTimer）。
+    if enableAutoWalkTimer and not autoWalkTimers[pid] then
+        autoWalkTimers[pid] = timer.every(500, "move.on_auto_walk_tick")
     end
-    autoWalkTimers[pid] = timer.every(500, "move.on_auto_walk_tick")
 end
+
+-- 逐帧日志默认关闭：开启后每个玩家每 500ms 产生一条日志，
+-- 万级并发下即为每秒数万条，属于直接的吞吐与磁盘灾难。
+local autoWalkLog = false
 
 function move.on_auto_walk_tick(timerId)
     -- LuaEnv 会给回调传 timerId；玩家身份由框架在发起时记录（回投到同一线程）
-    util.log_info("auto walk tick, timerId=%s", tostring(timerId))
+    if autoWalkLog then
+        util.log_info("auto walk tick, timerId=%s", tostring(timerId))
+    end
 end
 
 function move.c2s_path(session, pid, req)
